@@ -252,13 +252,21 @@ class JobManager:
                 )
             async for notification in conn.session_prompt(final_prompt):
                 if "_prompt_result" in notification:
-                    if "error" in notification["_prompt_result"]:
-                        job.error = str(notification["_prompt_result"]["error"])
-                        job.status = "failed"
-                    else:
-                        job.status = "completed"
                     from .agents import _record_acp_usage
                     _record_acp_usage(job.agent, notification["_prompt_result"], 0)
+                    if "error" in notification["_prompt_result"]:
+                        error = notification["_prompt_result"]["error"]
+                        message = error.get("message", str(error)) if isinstance(error, dict) else str(error)
+                        job.error = message
+                        job.status = "failed"
+                        lowered = message.lower()
+                        if "timeout" in lowered or "idle" in lowered:
+                            raise AgentTimeoutError(message)
+                        if "rate limit" in lowered or "429" in lowered:
+                            raise AgentRateLimitError(message)
+                        raise AgentModelError(message)
+                    else:
+                        job.status = "completed"
                     break
                 event = transform_notification(notification)
                 if not event:
@@ -268,9 +276,11 @@ class JobManager:
                 elif event["type"] == "tool.done" and event.get("title"):
                     job.tools.append(event["title"])
         except Exception:
-            self._pool.remove(job.agent, job.session_id)
+            await self._pool.remove(job.agent, job.session_id)
             raise
         job.result = "".join(parts)
+        if job.status != "completed":
+            await self._pool.remove(job.agent, job.session_id)
         return job.status == "completed"
 
     async def _run_acp(self, job: Job):
@@ -333,7 +343,7 @@ class JobManager:
                 job.error = str(e)
                 job.status = "failed"
                 job.result = "".join(parts)
-                self._pool.remove(job.agent, job.session_id)
+                await self._pool.remove(job.agent, job.session_id)
                 return
 
         # Exhausted all retry attempts

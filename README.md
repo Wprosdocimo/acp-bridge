@@ -155,7 +155,7 @@ Clients → acp-bridge (:18010)
 
 ## Changelog
 
-See [CHANGELOG.md](CHANGELOG.md) for full version history. Current: v0.35.2
+See [CHANGELOG.md](CHANGELOG.md) for full version history. Current: v0.35.3
 
 ## Contributing
 

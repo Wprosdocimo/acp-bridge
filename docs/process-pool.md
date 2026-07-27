@@ -22,6 +22,8 @@ Same session reuses the same subprocess across turns — conversation context is
 
 If a subprocess crashes mid-session, Bridge rebuilds it automatically. Context is lost, and the user is notified.
 
+If initialization, prompt streaming, or JSON-RPC request handling fails, Bridge removes the connection and waits for the entire subprocess group to terminate before retrying or falling back. Timed-out request futures are canceled and removed so late responses cannot poison the reader loop.
+
 ## LRU Eviction
 
 When the pool is full and a new connection is needed:

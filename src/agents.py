@@ -124,7 +124,7 @@ async def _execute_agent_call(
         log.error("agent_init_failed: agent=%s error=%s", agent_name, e)
         if _stats:
             _stats.record(agent_name, session_id, False, 0)
-        return False, results
+        raise
 
     _t0 = time.time()
     _tools_used: list[str] = []
@@ -153,10 +153,17 @@ async def _execute_agent_call(
                 log.info("acp_done: agent=%s session=%s stop=%s",
                          agent_name, session_id,
                          notification["_prompt_result"].get("result", {}).get("stopReason", "?"))
-                if "error" in notification["_prompt_result"]:
-                    _success = False
-                # Extract and record usage from ACP _prompt_result
+                # Record any usage included with both successful and failed responses.
                 _record_acp_usage(agent_name, notification["_prompt_result"], time.time() - _t0)
+                if "error" in notification["_prompt_result"]:
+                    error = notification["_prompt_result"]["error"]
+                    message = error.get("message", str(error)) if isinstance(error, dict) else str(error)
+                    lowered = message.lower()
+                    if "timeout" in lowered or "idle" in lowered:
+                        raise AgentTimeoutError(message)
+                    if "rate limit" in lowered or "429" in lowered:
+                        raise AgentRateLimitError(message)
+                    raise AgentModelError(message)
                 continue
 
             event = transform_notification(notification)
@@ -190,7 +197,7 @@ async def _execute_agent_call(
 
     except Exception as e:
         log.error("agent_crashed: agent=%s session=%s error=%s", agent_name, session_id, e)
-        pool.remove(agent_name, session_id)
+        await pool.remove(agent_name, session_id)
         if _stats:
             _stats.record(agent_name, session_id, False, time.time() - _t0, _tools_used)
         # Classify for smart retry
@@ -237,8 +244,7 @@ async def _call_acp_agent_internal(
         for result in results:
             yield result
         if not success:
-            # Mark as failure manually since we collected all yields but got error in _prompt_result
-            breaker.record_failure()
+            raise AgentModelError(f"agent returned unsuccessful result: {agent_name}")
     except CircuitBreakerOpenError as e:
         log.warning("circuit_breaker_open: agent=%s error=%s", agent_name, e)
         raise AgentModelError(f"Circuit breaker open for {agent_name}") from e
@@ -376,7 +382,6 @@ def make_acp_agent_handler(agent_name: str, pool: AcpProcessPool, profile: dict 
             except AgentTimeoutError:
                 log.warning("agent_timeout: agent=%s attempt=%d, retrying async",
                            current_agent, attempt + 1)
-                get_circuit_breaker(current_agent).record_failure()
                 try:
                     retry_parts = await _handle_retry(
                         current_agent, prompt, pool, profile, session_id, cwd)
@@ -403,8 +408,6 @@ def make_acp_agent_handler(agent_name: str, pool: AcpProcessPool, profile: dict 
             except (AcpError, PoolExhaustedError, AgentModelError) as e:
                 log.warning("agent_failed: agent=%s attempt=%d error=%s",
                            current_agent, attempt + 1, e)
-                get_circuit_breaker(current_agent).record_failure()
-
                 # Try fallback to next agent
                 if attempt >= MAX_FALLBACK_ATTEMPTS - 1:
                     log.error("fallback_exhausted: agent=%s tried=%s",
@@ -433,7 +436,7 @@ def make_acp_agent_handler(agent_name: str, pool: AcpProcessPool, profile: dict 
 
                 log.info("fallback: agent=%s -> %s (attempt %d/%d)",
                         current_agent, next_agent, attempt + 1, MAX_FALLBACK_ATTEMPTS)
-                session_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{current_agent}:{session_id[:8]}"))
+                session_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{next_agent}:{session_id[:8]}"))
                 current_agent = next_agent
 
         except Exception as e:

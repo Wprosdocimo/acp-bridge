@@ -60,6 +60,11 @@ def setup_logging(verbose: bool):
     trace_filter = TraceIdFilter()
     for h in logging.getLogger().handlers:
         h.addFilter(trace_filter)
+    # Botocore DEBUG records include fully rendered request headers, including
+    # temporary AWS session credentials. Keep credential-bearing SDK internals
+    # out of logs even when Bridge verbose logging is enabled.
+    for logger_name in ("boto3", "botocore", "s3transfer"):
+        logging.getLogger(logger_name).setLevel(logging.WARNING)
     if not verbose:
         logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
 
@@ -209,6 +214,12 @@ def main():
     sec_cfg = config.get("security", {})
     srv_cfg = config.get("server", {})
     webhook_cfg = config.get("webhook", {})
+
+    auth_token = sec_cfg.get("auth_token", "")
+    if not auth_token:
+        log.error("security.auth_token resolved to an empty value; refusing to start")
+        log.error("Set ACP_BRIDGE_TOKEN or configure security.auth_token explicitly")
+        sys.exit(1)
 
     host = args.host or srv_cfg.get("host", "0.0.0.0")
     port = args.port or srv_cfg.get("port", 18010)
@@ -523,11 +534,10 @@ def main():
     app.router.lifespan_context = lifespan
 
     # --- Logging ---
-    auth_token = sec_cfg.get("auth_token", "")
     log.info("allowed_ips=%s", sec_cfg.get("allowed_ips", []))
     if pool:
         log.info("pool: max=%d max_per_agent=%d busy_timeout=%ds", pool_cfg.get("max_processes", 20), pool_cfg.get("max_per_agent", 10), busy_timeout)
-    log.info("auth_token=%s", auth_token[:8] + "..." if len(auth_token) > 8 else auth_token)
+    log.info("authentication configured")
     if job_mgr:
         log.info("jobs: monitor=60s stuck_timeout=600s webhook=%s", webhook_cfg.get("url", "(none)"))
     webhook_token = webhook_cfg.get("token", "")

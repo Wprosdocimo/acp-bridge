@@ -326,9 +326,9 @@ Response:
 |-------|---------|-------------|
 | `limit` | `20` | Number of records |
 
-### `POST /internal/llm-callback` (no auth)
+### `POST /internal/llm-callback` (loopback only, no Bearer auth)
 
-Receives `StandardLoggingPayload` from LiteLLM `generic_api` callback. Not intended for direct use.
+Receives `StandardLoggingPayload` from LiteLLM `generic_api` callback. Requests from non-loopback clients are rejected with HTTP 403. Not intended for direct use.
 
 ## Prompt Log
 

@@ -58,8 +58,13 @@ class AcpConnection:
             msg["params"] = params
         fut: asyncio.Future[dict] = asyncio.get_event_loop().create_future()
         self._pending[req_id] = fut
-        await self._send(msg)
-        result = await fut
+        try:
+            await self._send(msg)
+            result = await fut
+        finally:
+            pending = self._pending.pop(req_id, None)
+            if pending is not None and not pending.done():
+                pending.cancel()
         if "error" in result:
             raise AcpError(f"ACP error on {method}: {result['error']}")
         return result.get("result")
@@ -120,7 +125,9 @@ class AcpConnection:
                     log.debug("acp_recv: %s", line.decode().rstrip()[:500])
                 msg_id = msg.get("id")
                 if msg_id is not None and msg_id in self._pending:
-                    self._pending.pop(msg_id).set_result(msg)
+                    fut = self._pending.pop(msg_id)
+                    if not fut.done():
+                        fut.set_result(msg)
                 else:
                     # Auto-reply permission requests (e.g. claude-agent-acp)
                     if msg.get("method") == "session/request_permission" and msg_id is not None:
@@ -280,13 +287,18 @@ class AcpConnection:
         }
         fut: asyncio.Future[dict] = asyncio.get_event_loop().create_future()
         self._pending[req_id] = fut
-        await self._send(msg)
 
         try:
+            await self._send(msg)
             while True:
                 if fut.done():
                     break
                 if time.time() - last_event_time > idle_timeout:
+                    try:
+                        await self.session_cancel()
+                    except Exception:
+                        log.debug("session_cancel_failed: agent=%s session=%s",
+                                  self.agent, self.session_id)
                     yield {"_prompt_result": {"error": {"code": -1, "message": "agent_timeout (idle)"}}}
                     return
                 try:
@@ -318,6 +330,9 @@ class AcpConnection:
             result = fut.result() if fut.done() else {"error": {"code": -1, "message": "no response"}}
             yield {"_prompt_result": result}
         finally:
+            pending = self._pending.pop(req_id, None)
+            if pending is not None and not pending.done():
+                pending.cancel()
             self._unsubscribe(sub_id)
             self.last_active = time.time()
             self._busy = False
@@ -420,7 +435,12 @@ class AcpProcessPool:
         log.info("lru_reuse: agent=%s session=%s→%s", new_agent, old_key[1], new_session_id)
         conn.session_id = new_session_id
         conn.session_reset = True
-        await conn.session_new(cwd or self._config[new_agent].get("working_dir", "/tmp"), profile=profile)
+        try:
+            await conn.session_new(cwd or self._config[new_agent].get("working_dir", "/tmp"), profile=profile)
+        except Exception:
+            await conn.kill()
+            self._save_pids()
+            raise
         self._connections[new_key] = conn
         self._save_pids()
         return conn
@@ -514,11 +534,15 @@ class AcpProcessPool:
         conn = AcpConnection(agent=agent, session_id=session_id, proc=proc, verbose=self._verbose)
         if is_rebuild:
             conn.session_reset = True
-        await conn.initialize()
-        if resume_session_id:
-            await conn.session_load(cwd, resume_session_id)
-        else:
-            await conn.session_new(cwd, profile=profile)
+        try:
+            await conn.initialize()
+            if resume_session_id:
+                await conn.session_load(cwd, resume_session_id)
+            else:
+                await conn.session_new(cwd, profile=profile)
+        except Exception:
+            await conn.kill()
+            raise
         return conn
 
     async def close(self, agent: str, session_id: str) -> None:
@@ -529,8 +553,13 @@ class AcpProcessPool:
             await conn.kill()
             self._save_pids()
 
-    def remove(self, agent: str, session_id: str) -> None:
-        self._connections.pop((agent, session_id), None)
+    async def remove(self, agent: str, session_id: str) -> None:
+        """Remove a connection and terminate its entire subprocess group."""
+        conn = self._connections.pop((agent, session_id), None)
+        if conn:
+            log.info("removing: agent=%s session=%s", agent, session_id)
+            await conn.kill()
+            self._save_pids()
 
     async def cleanup_idle(self, ttl_seconds: float) -> None:
         now = time.time()

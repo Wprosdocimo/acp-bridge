@@ -44,7 +44,7 @@ class FailThenSucceedPool:
             raise PoolExhaustedError(f"{agent} pool exhausted")
         return FakeConn(self.success_text)
 
-    def remove(self, agent, session_id):
+    async def remove(self, agent, session_id):
         pass
 
 
@@ -57,7 +57,7 @@ class AlwaysFailPool:
         self.calls.append(agent)
         raise AcpError(f"{agent} error")
 
-    def remove(self, agent, session_id):
+    async def remove(self, agent, session_id):
         pass
 
 
@@ -265,7 +265,7 @@ def test_acp_error_triggers_fallback():
             if agent == "kiro":
                 raise AcpError("idle_timeout")
             return FakeConn("recovered")
-        def remove(self, agent, session_id):
+        async def remove(self, agent, session_id):
             pass
 
     pool = AcpErrorPool()
@@ -281,6 +281,41 @@ def test_acp_error_triggers_fallback():
     print("✅ test_acp_error_triggers_fallback")
 
 
+def test_prompt_result_error_triggers_fallback():
+    """An ACP prompt-result error is classified and routed to fallback."""
+    class PromptErrorConn:
+        async def session_prompt(self, prompt):
+            yield {"_prompt_result": {"error": {"code": -1, "message": "model failed"}}}
+
+    class PromptErrorPool:
+        def __init__(self):
+            self.calls = []
+            self.removed = []
+            self._connections = {}
+
+        async def get_or_create(self, agent, session_id, cwd="", profile=None):
+            self.calls.append(agent)
+            if agent == "kiro":
+                return PromptErrorConn()
+            return FakeConn("fallback-after-prompt-error")
+
+        async def remove(self, agent, session_id):
+            self.removed.append((agent, session_id))
+
+    pool = PromptErrorPool()
+    mgr = make_manager(pool)
+    job = make_job("kiro")
+
+    asyncio.run(mgr._run_acp(job))
+
+    assert job.status == "completed"
+    assert job.agent != "kiro"
+    assert job.result == "fallback-after-prompt-error"
+    assert job.fallback_history == ["kiro"]
+    assert pool.calls == ["kiro", job.agent]
+    assert pool.removed == [("kiro", "s1")]
+
+
 def test_generic_exception_no_fallback():
     """Non-ACP exceptions (e.g. RuntimeError) do NOT trigger fallback."""
     class CrashPool:
@@ -289,7 +324,7 @@ def test_generic_exception_no_fallback():
         async def get_or_create(self, agent, session_id, cwd="", profile=None):
             self.calls.append(agent)
             raise RuntimeError("unexpected crash")
-        def remove(self, agent, session_id):
+        async def remove(self, agent, session_id):
             pass
 
     pool = CrashPool()
@@ -323,7 +358,7 @@ def test_tried_agents_prevents_duplicate():
             call_count[agent] += 1
             # Always fail to exhaust all fallbacks
             raise PoolExhaustedError(f"{agent} exhausted")
-        def remove(self, agent, session_id):
+        async def remove(self, agent, session_id):
             pass
     
     pool = TrackedPool()
@@ -354,7 +389,7 @@ def test_fallback_exhaustion_error_message():
         _connections = {}
         async def get_or_create(self, agent, session_id, cwd="", profile=None):
             raise PoolExhaustedError(f"{agent} pool exhausted")
-        def remove(self, agent, session_id):
+        async def remove(self, agent, session_id):
             pass
     
     pool = AlwaysFailPool()
@@ -386,7 +421,7 @@ def test_timeout_retries_same_agent():
             if agent == "kiro" and len([c for c in call_log if c == "kiro"]) == 1:
                 raise AgentTimeoutError("timeout")
             return FakeConn("recovered")
-        def remove(self, agent, session_id):
+        async def remove(self, agent, session_id):
             pass
 
     pool = TimeoutThenOkPool()
@@ -409,7 +444,7 @@ def test_timeout_falls_back_if_retry_fails():
             if agent == "kiro":
                 raise AgentTimeoutError("timeout")
             return FakeConn("fallback-ok")
-        def remove(self, agent, session_id):
+        async def remove(self, agent, session_id):
             pass
 
     pool = AlwaysTimeoutPool()
@@ -435,7 +470,7 @@ def test_rate_limit_waits_and_retries():
             if agent == "kiro" and len([c for c in call_log if c == "kiro"]) == 1:
                 raise AgentRateLimitError("429", retry_after=1)
             return FakeConn("ok-after-wait")
-        def remove(self, agent, session_id):
+        async def remove(self, agent, session_id):
             pass
 
     pool = RateLimitThenOkPool()
@@ -461,7 +496,7 @@ def test_model_error_skips_to_fallback():
             if agent == "kiro":
                 raise AgentModelError("model crashed")
             return FakeConn("fallback-ok")
-        def remove(self, agent, session_id):
+        async def remove(self, agent, session_id):
             pass
 
     pool = ModelErrorPool()
@@ -484,7 +519,7 @@ def test_max_fallback_retries_limit():
         async def get_or_create(self, agent, session_id, cwd="", profile=None):
             attempts.append(agent)
             raise PoolExhaustedError(f"{agent} exhausted")
-        def remove(self, agent, session_id):
+        async def remove(self, agent, session_id):
             pass
     
     pool = CountingPool()
@@ -515,7 +550,7 @@ def test_successful_fallback_on_second_attempt():
                 raise PoolExhaustedError(f"{agent} exhausted")
             return FakeConn("succeeded-on-third")
         
-        def remove(self, agent, session_id):
+        async def remove(self, agent, session_id):
             pass
     
     pool = SequentialFailPool()

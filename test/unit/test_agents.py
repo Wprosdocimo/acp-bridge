@@ -30,22 +30,19 @@ class MockCircuitBreaker:
 @pytest.fixture
 def agent_pool():
     """Create a fresh AgentPool instance for each test."""
-    # TODO: Initialize with test configuration
-    pass
+    pytest.skip("placeholder suite: no AgentPool implementation exists")
 
 
 @pytest.fixture
 def mock_agents():
     """Create mock agent instances with configurable behavior."""
-    # TODO: Return dict of mock agents (e.g., {"agent_a": mock_a, "agent_b": mock_b})
-    pass
+    pytest.skip("placeholder suite: no mock agent contract was defined")
 
 
 @pytest.fixture
 def agent_stats():
     """Create default AgentStats for testing."""
-    # TODO: Return AgentStats with typical values
-    pass
+    pytest.skip("placeholder suite: no AgentStats fixture was defined")
 
 
 # ============================================================================
@@ -534,12 +531,12 @@ class TestConnectionLeakAndRetrySafety:
         conn.session_prompt = crashing_prompt
         conn.session_reset = False
         pool.get_or_create = AsyncMock(return_value=conn)
-        pool.remove = Mock()
+        pool.remove = AsyncMock()
 
         with pytest.raises(RuntimeError, match="connection died mid-stream"):
             await _execute_agent_call("kiro", "test", pool, None, "s1", "/tmp")
 
-        pool.remove.assert_called_once_with("kiro", "s1")
+        pool.remove.assert_awaited_once_with("kiro", "s1")
 
     @pytest.mark.asyncio
     async def test_execute_agent_call_cleans_up_on_enrich_crash(self):
@@ -551,7 +548,7 @@ class TestConnectionLeakAndRetrySafety:
         conn = AsyncMock()
         conn.session_reset = False
         pool.get_or_create = AsyncMock(return_value=conn)
-        pool.remove = Mock()
+        pool.remove = AsyncMock()
 
         bad_env = Mock()
         bad_env.get_prefix = Mock(side_effect=RuntimeError("env crash"))
@@ -560,7 +557,7 @@ class TestConnectionLeakAndRetrySafety:
         try:
             with pytest.raises(RuntimeError, match="env crash"):
                 await _execute_agent_call("kiro", "test", pool, None, "s1", "/tmp", enrich_prompt=True)
-            pool.remove.assert_called_once_with("kiro", "s1")
+            pool.remove.assert_awaited_once_with("kiro", "s1")
         finally:
             _mod._env = saved
 
@@ -579,10 +576,62 @@ class TestConnectionLeakAndRetrySafety:
 
         conn.session_prompt = crash_prompt
         pool.get_or_create = AsyncMock(return_value=conn)
-        pool.remove = Mock()
+        pool.remove = AsyncMock()
 
         with pytest.raises(AgentTimeoutError):
             await _handle_retry("kiro", "test", pool, None, "s1", "/tmp")
+
+    @pytest.mark.asyncio
+    async def test_prompt_timeout_cleans_pending_future(self):
+        """A timed-out JSON-RPC prompt must not retain a pending Future."""
+        proc = Mock()
+        proc.returncode = None
+        proc.pid = 99999
+        proc.stdin = Mock()
+        proc.stdin.write = Mock()
+        proc.stdin.drain = AsyncMock()
+        conn = AcpConnection("kiro", "s1", proc)
+        conn.acp_session_id = "acp-s1"
+
+        events = [event async for event in conn.session_prompt("test", idle_timeout=-1)]
+
+        assert "error" in events[-1]["_prompt_result"]
+        assert conn._pending == {}
+        assert conn._busy is False
+
+    @pytest.mark.asyncio
+    async def test_pool_remove_terminates_connection(self):
+        """Removing a failed connection waits for subprocess termination."""
+        pool = AcpProcessPool({"kiro": {"command": "unused"}})
+        conn = Mock(spec=AcpConnection)
+        conn.kill = AsyncMock()
+        pool._connections[("kiro", "s1")] = conn
+
+        await pool.remove("kiro", "s1")
+
+        conn.kill.assert_awaited_once()
+        assert ("kiro", "s1") not in pool._connections
+
+    @pytest.mark.asyncio
+    async def test_prompt_result_error_is_propagated_and_connection_removed(self):
+        """ACP result errors must reach circuit-breaker/fallback handling."""
+        from src.agents import _execute_agent_call
+
+        conn = AsyncMock()
+        conn.session_reset = False
+
+        async def failed_prompt(prompt, idle_timeout=300):
+            yield {"_prompt_result": {"error": {"code": -1, "message": "model failed"}}}
+
+        conn.session_prompt = failed_prompt
+        pool = Mock()
+        pool.get_or_create = AsyncMock(return_value=conn)
+        pool.remove = AsyncMock()
+
+        with pytest.raises(AgentModelError, match="model failed"):
+            await _execute_agent_call("kiro", "test", pool, None, "s1", "/tmp")
+
+        pool.remove.assert_awaited_once_with("kiro", "s1")
 
 
 # ============================================================================

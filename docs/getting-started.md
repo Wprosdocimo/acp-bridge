@@ -194,10 +194,10 @@ export ACP_BRIDGE_URL=http://localhost:18010
 
 # Option 2: curl
 curl -s http://localhost:18010/ready
-# → {"status":"ready","version":"0.35.2","agents_configured":9,"pool_state":"cold"}
+# → {"status":"ready","version":"0.35.3","agents_configured":9,"pool_state":"cold"}
 
 curl -s http://localhost:18010/health
-# → {"status":"ok","version":"0.35.2", ...}
+# → {"status":"ok","version":"0.35.3", ...}
 
 curl -s --max-time 120 -X POST http://localhost:18010/runs \
   -H "Authorization: Bearer $ACP_BRIDGE_TOKEN" \

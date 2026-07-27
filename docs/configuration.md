@@ -31,7 +31,7 @@ webhook:
   target: "channel:<default-channel-id>"        # default push target
 
 security:
-  auth_token: "${ACP_BRIDGE_TOKEN}"             # Bearer token (supports env var refs)
+  auth_token: "${ACP_BRIDGE_TOKEN}"             # required, non-empty Bearer token
   allowed_ips:                                  # IP allowlist
     - "127.0.0.1"
 

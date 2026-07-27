@@ -22,9 +22,13 @@ Bridge uses dual authentication:
 1. **Bearer Token** — `Authorization: Bearer <token>` header on every request
 2. **IP Allowlist** — only requests from `security.allowed_ips` are accepted
 
-Both must pass. `/live`, `/ready`, `/health`, and `/ui` are unauthenticated (for load balancer probes and browser access). The IP allowlist still applies to these paths.
+Both must pass. `/live`, `/ready`, `/health`, and `/ui` are unauthenticated (for load balancer probes and browser access). The public Agent Card and A2A routes use their documented mesh-token policy. The IP allowlist still applies to every path.
 
-Token supports `${ENV_VAR}` references in config — keep actual values in `.env` or environment only.
+Token supports `${ENV_VAR}` references in config — keep actual values in `.env` or environment only. If `security.auth_token` resolves to an empty value, Bridge refuses to start instead of silently disabling authentication.
+
+Verbose Bridge logging suppresses credential-bearing AWS SDK internals so temporary IAM session headers are not written to the service journal.
+
+File and Pipeline artifact downloads require the normal Bearer token. The LiteLLM usage callback does not require the Bridge token, but accepts requests only from loopback clients (`127.0.0.0/8` or `::1`).
 
 ## Deployment Recommendations
 

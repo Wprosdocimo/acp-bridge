@@ -243,6 +243,14 @@ _get_fallback_agent() {
 }
 
 retry() {
+    # Streaming responses must flow directly into the SSE parser. Capturing
+    # call_api with $(...) buffers the entire response and makes --stream hang
+    # silently when a server/agent leaves the connection open.
+    if [[ "$MODE" == "stream" ]]; then
+        call_api
+        return
+    fi
+
     local attempt=0
     local orig_agent="$AGENT"
     while true; do

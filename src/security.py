@@ -10,6 +10,7 @@ from starlette.responses import JSONResponse
 NO_AUTH_PATHS = {"/live", "/ready", "/health", "/ui", "/internal/llm-callback",
                  "/.well-known/agent.json", "/a2a/announce", "/a2a"}
 NO_AUTH_PREFIXES = ("/static/",)
+LOCAL_ONLY_PATHS = {"/internal/llm-callback"}
 MAX_BODY_BYTES = 1 * 1024 * 1024  # 1 MB
 
 
@@ -18,6 +19,8 @@ class SecurityMiddleware(BaseHTTPMiddleware):
                  rate_limit: int = 60, rate_window: int = 60,
                  max_body: int = MAX_BODY_BYTES):
         super().__init__(app)
+        if not auth_token:
+            raise ValueError("security.auth_token must not be empty")
         # Separate plain IPs and CIDR networks
         self._plain_ips: set[str] = set()
         self._networks: list = []
@@ -71,9 +74,15 @@ class SecurityMiddleware(BaseHTTPMiddleware):
         if not self._ip_allowed(client_ip):
             return JSONResponse({"error": "forbidden"}, status_code=403)
 
+        if request.url.path in LOCAL_ONLY_PATHS:
+            try:
+                if not ip_address(client_ip).is_loopback:
+                    return JSONResponse({"error": "forbidden"}, status_code=403)
+            except ValueError:
+                return JSONResponse({"error": "forbidden"}, status_code=403)
+
         if self.auth_token and request.url.path not in NO_AUTH_PATHS:
-            skip = request.url.path.startswith(NO_AUTH_PREFIXES) or \
-                   (request.method == "GET" and "/download" in request.url.path)
+            skip = request.url.path.startswith(NO_AUTH_PREFIXES)
             if not skip:
                 auth = request.headers.get("authorization", "")
                 if auth != f"Bearer {self.auth_token}":
@@ -84,7 +93,11 @@ class SecurityMiddleware(BaseHTTPMiddleware):
 
         # Body size check (Content-Length header, fast path)
         cl = request.headers.get("content-length")
-        if cl and int(cl) > self.max_body:
-            return JSONResponse({"error": "payload_too_large"}, status_code=413)
+        if cl:
+            try:
+                if int(cl) > self.max_body:
+                    return JSONResponse({"error": "payload_too_large"}, status_code=413)
+            except ValueError:
+                return JSONResponse({"error": "invalid_content_length"}, status_code=400)
 
         return await call_next(request)

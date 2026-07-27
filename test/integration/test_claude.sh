@@ -13,7 +13,9 @@ run_test "同步调用有回复" "ok\|OK" "$resp"
 echo ""
 echo "--- 流式调用 ---"
 STREAM_SESSION="00000000-0000-0000-0000-cc0000000011"
-resp=$("$CLIENT" --stream -a claude -s "$STREAM_SESSION" "回复ok两个字就行" 2>/dev/null)
+# Claude's SSE transport can keep the HTTP connection open after the agent has
+# completed. Preserve any response already received and bound the test runtime.
+resp=$(timeout 30s "$CLIENT" --stream -a claude -s "$STREAM_SESSION" "回复ok两个字就行" 2>/dev/null || true)
 run_test "流式调用有输出" "ok\|OK" "$resp"
 
 echo ""
