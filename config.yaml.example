@@ -145,6 +145,37 @@ agents:
         - {type: "source-code", url: "https://github.com/NousResearch/hermes-agent"}
         - {type: "homepage", url: "https://hermesagent.org.cn"}
 
+  # AWS DevOps Agent — optional, disabled by default.
+  # Install the reviewed AWS sample in an isolated virtual environment first;
+  # replace both absolute paths below. The safe launcher requires a fixed user
+  # and AgentSpace, blocks implicit AgentSpace creation, and only starts a deep
+  # investigation for an explicit `/investigate ...` prompt by default.
+  aws-devops:
+    enabled: false
+    mode: "acp"
+    command: "/opt/aws-devops-agent/.venv/bin/python"
+    acp_args: ["/opt/acp-bridge/src/adapters/aws_devops_launcher.py"]
+    working_dir: "/tmp/aws-devops-agent"
+    idle_ttl: 3600
+    description: "AWS DevOps Agent (safe ACP launcher)"
+    env:
+      DEVOPS_AGENT_USER_ID: "${DEVOPS_AGENT_USER_ID}"
+      DEVOPS_AGENT_REGION: "${DEVOPS_AGENT_REGION}"
+      DEVOPS_AGENT_SPACE_ID: "${DEVOPS_AGENT_SPACE_ID}"
+      DEVOPS_AGENT_AUTO_CREATE_SPACE: "false"
+      ACP_BRIDGE_AWS_INVESTIGATION_MODE: "explicit"
+      ACP_BRIDGE_AWS_REQUIRE_SPACE_ID: "true"
+      ACP_BRIDGE_AWS_ALLOW_SPACE_CREATE: "false"
+    metadata:
+      author: {name: "AWS", url: "https://aws.amazon.com"}
+      license: "MIT-0"
+      programming_language: "Python"
+      natural_languages: ["en"]
+      domains: ["devops", "cloud", "incident-response", "cost"]
+      tags: ["aws", "operations", "acp"]
+      links:
+        - {type: "source-code", url: "https://github.com/aws-samples/sample-aws-devops-agent-acp-mcp"}
+
 # webhook (optional): async job completion callback
 # format: "openclaw" (default) or "generic" (plain JSON POST to any URL)
 #

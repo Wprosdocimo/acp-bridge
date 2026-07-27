@@ -18,6 +18,7 @@
 | [OpenCode](https://github.com/opencode-ai/opencode) | Open Source | ✅ `opencode acp` | `acp` | ✅ Integrated | 6/6 | See [repo](https://github.com/opencode-ai/opencode) |
 | [Harness Factory](https://github.com/xiwan/harness-factory) | Open Source | ✅ Native | `acp` | ✅ Integrated | 4/4 | See [repo](https://github.com/xiwan/harness-factory) |
 | [Hermes Agent](https://github.com/NousResearch/hermes-agent) | Nous Research | ✅ `hermes acp` | `acp` | ✅ Integrated | 8/8 | `uv tool install 'hermes-agent[acp] @ git+...'` |
+| [AWS DevOps Agent](https://github.com/aws-samples/sample-aws-devops-agent-acp-mcp) | AWS | ✅ Native | `acp` | ✅ Optional safe launcher | 16 unit | Install reviewed sample in isolated venv |
 | [OpenClaw](https://github.com/openclaw/openclaw) | Open Source | ✅ `openclaw acp` | `acp` | ✅ Integrated | — | `sudo npm i -g openclaw` |
 | [CoStrict](https://github.com/zgsm-ai/costrict) | Open Source 🇨🇳 | ✅ Native | — | 🟡 Planned | — | — |
 | [Trae Agent](https://github.com/bytedance/trae-agent) | ByteDance 🇨🇳 | ❌ | `pty` | ✅ Integrated | 4/4 | `cd trae-agent && uv sync --all-extras` |
@@ -105,9 +106,73 @@ agents:
 - Also serves as webhook callback target via its webhook adapter
 - Configure `format: "generic"` in Bridge webhook config to use Hermes for IM delivery
 
+### AWS DevOps Agent
+
+AWS's [`sample-aws-devops-agent-acp-mcp`](https://github.com/aws-samples/sample-aws-devops-agent-acp-mcp)
+provides a native stdio ACP server. Bridge uses it through
+`src/adapters/aws_devops_launcher.py`; the shared ACP client is unchanged.
+
+#### Install the reviewed sample
+
+Keep this optional dependency outside the Bridge environment. The commit below
+is the v1.0.0 implementation reviewed for this integration; review upstream
+changes before moving the pin.
+
+```bash
+git clone https://github.com/aws-samples/sample-aws-devops-agent-acp-mcp.git /opt/aws-devops-agent
+git -C /opt/aws-devops-agent checkout 6d4f1d295def858d56c4020fa20744d3ce78ee12
+uv venv /opt/aws-devops-agent/.venv --python 3.12
+uv pip install --python /opt/aws-devops-agent/.venv/bin/python -e /opt/aws-devops-agent
+```
+
+Configure AWS credentials for the same OS account that runs the Bridge service,
+preferably with an EC2 instance role or ECS task role. Do not place access keys
+in `config.yaml`. Set these non-secret selectors in `.env` or the systemd unit:
+
+```bash
+DEVOPS_AGENT_USER_ID=<operator-id>
+DEVOPS_AGENT_REGION=us-east-1
+DEVOPS_AGENT_SPACE_ID=<existing-agent-space-id>
+```
+
+Copy the disabled `agents.aws-devops` block from `config.yaml.example`, replace
+the two `/opt/...` paths if needed, and set `enabled: true`. Safe defaults are:
+
+- a fixed `DEVOPS_AGENT_USER_ID` and `DEVOPS_AGENT_SPACE_ID` are required;
+- AgentSpace auto-creation is blocked;
+- ordinary incident language remains a normal chat request;
+- only `/investigate <incident description>` starts a deep investigation.
+
+Launcher controls:
+
+| Variable | Default | Meaning |
+|----------|---------|---------|
+| `ACP_BRIDGE_AWS_INVESTIGATION_MODE` | `explicit` | `disabled`, `explicit`, or upstream-compatible `auto` |
+| `ACP_BRIDGE_AWS_REQUIRE_SPACE_ID` | `true` | Set `false` only to allow upstream read-only AgentSpace discovery |
+| `ACP_BRIDGE_AWS_ALLOW_SPACE_CREATE` | `false` | Must be `true` together with `DEVOPS_AGENT_AUTO_CREATE_SPACE=true` to create a space |
+
+Call normal chat like any other Bridge agent. Start investigation only when
+intended:
+
+```text
+agent: aws-devops
+prompt: /investigate root cause of checkout-service 503 errors
+```
+
+The upstream server returns the initial chat response and investigation task ID,
+then emits journal updates in the background. Bridge v0.36.0 intentionally does
+not change its request-scoped ACP event lifecycle, so later journal notifications
+are not guaranteed to appear in the completed `/runs` response. Use the task ID
+for operational follow-up. Also avoid ACP `resume_session_id`: the sample does
+not implement `session/load`.
+
+Before production use, follow the upstream onboarding guide for the caller role
+and AgentSpace service role, enable CloudTrail, and validate in a non-production
+account. Investigation can consume API quota and incur charges.
+
 ## Zero-Config Auto-Detection
 
-When no `config.yaml` is present, Bridge scans `PATH` for known agent CLIs and registers them with default settings. Supported: `kiro-cli`, `claude-agent-acp`, `codex`, `trae-cli`, `qwen`, `opencode`, `hermes`, `harness-factory`.
+When no `config.yaml` is present, Bridge scans `PATH` for known agent CLIs and registers them with default settings. Supported: `kiro-cli`, `claude-agent-acp`, `codex`, `trae-cli`, `qwen`, `opencode`, `hermes`, `harness-factory`. AWS DevOps Agent is deliberately excluded from zero-config discovery because its identity, AgentSpace, and investigation policy must be explicit.
 
 ## Writing a New Agent
 

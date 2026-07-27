@@ -29,7 +29,7 @@
 [![Agent Guide](https://img.shields.io/badge/Agent_Guide-for_AI_Agents-blue?logo=robot)](AGENT.md)
 [![AWS Blog](https://img.shields.io/badge/AWS_Blog-Published-orange?logo=amazonaws)](https://aws.amazon.com/cn/blogs/china/enable-kiro-and-claude-code-for-im-with-acp-bridge-async-ai-workflow/)
 
-A multi-agent orchestration platform that exposes local CLI agents (Kiro, Claude Code, Codex, Qwen, OpenCode, Hermes, etc.) as HTTP services via [ACP](https://agentclientprotocol.com/), with pipeline orchestration and IM-driven async workflows.
+A multi-agent orchestration platform that exposes local CLI agents (Kiro, Claude Code, Codex, Qwen, OpenCode, Hermes, AWS DevOps Agent, etc.) as HTTP services via [ACP](https://agentclientprotocol.com/), with pipeline orchestration and IM-driven async workflows.
 
 ## Why ACP Bridge
 
@@ -44,6 +44,7 @@ A multi-agent orchestration platform that exposes local CLI agents (Kiro, Claude
 | **Composable pipelines** | Chain conversation → parallel across shared workspace; pause/inject for human-in-the-loop control |
 | **Prompt-as-a-service** | Define reusable [prompt templates](docs/api-reference.md); non-technical users pick a template and fill in variables |
 | **Agent marketplace** | Same [`harness-factory`](https://github.com/xiwan/harness-factory) binary + different profiles = code reviewer, DevOps helper, translator — all behind one API |
+| **AWS operations** | Call AWS DevOps Agent through a fail-closed ACP launcher with fixed identity/AgentSpace and explicit investigation opt-in |
 
 ## Quick Start
 
@@ -155,7 +156,7 @@ Clients → acp-bridge (:18010)
 
 ## Changelog
 
-See [CHANGELOG.md](CHANGELOG.md) for full version history. Current: v0.35.3
+See [CHANGELOG.md](CHANGELOG.md) for full version history. Current: v0.36.0
 
 ## Contributing
 

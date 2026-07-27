@@ -2,7 +2,7 @@
 
 > You are the executing agent. Human docs → [README.md](README.md)
 
-ACP Bridge exposes local CLI agents (Kiro/Claude/Codex/Qwen/OpenCode/Hermes/Harness Factory) via HTTP with async job support.
+ACP Bridge exposes local CLI agents (Kiro/Claude/Codex/Qwen/OpenCode/Hermes/AWS DevOps Agent/Harness Factory) via HTTP with async job support.
 Harness Factory 0.6.0+ has a built-in model registry (8 models, 7 providers) with `"auto"` random selection and error fallback.
 
 ```
@@ -36,6 +36,7 @@ which codex 2>/dev/null && echo "CODEX_OK" || echo "CODEX_NOT_FOUND"
 which qwen 2>/dev/null && echo "QWEN_OK" || echo "QWEN_NOT_FOUND"
 which opencode 2>/dev/null && echo "OPENCODE_OK" || echo "OPENCODE_NOT_FOUND"
 which hermes 2>/dev/null && echo "HERMES_OK" || echo "HERMES_NOT_FOUND"
+which aws-devops-agent-acp 2>/dev/null && echo "AWS_DEVOPS_OK" || echo "AWS_DEVOPS_NOT_FOUND"
 which harness-factory 2>/dev/null && echo "HARNESS_OK" || echo "HARNESS_NOT_FOUND"
 
 echo "=== Service ==="
@@ -76,6 +77,7 @@ Based on diagnostic results, ask the human for **only** what you cannot determin
 | `LITELLM_API_KEY` | `NOT_SET` and Codex/Qwen agent is needed | LiteLLM proxy token |
 | `CLAUDE_CODE_USE_BEDROCK` | Claude agent needed on Bedrock | `1` |
 | `ANTHROPIC_MODEL` | Claude agent needed on Bedrock | e.g. `us.anthropic.claude-sonnet-4-20250514` |
+| `DEVOPS_AGENT_USER_ID` / `DEVOPS_AGENT_SPACE_ID` | AWS DevOps Agent requested | Explicit operator ID and existing AgentSpace |
 | Which agents to enable | Always (list what's found vs what's available) | `claude` / `kiro` / `codex` / `qwen` / `opencode` / `hermes` |
 | Startup method | Always (unless already running) | Docker / systemd / nohup |
 
@@ -105,8 +107,13 @@ Execute each step. **Skip if diagnostic shows it's already done.**
 | Qwen Code | ACP | `npm i -g @anthropic-ai/qwen-code` |
 | OpenCode | ACP | See [opencode-ai/opencode](https://github.com/opencode-ai/opencode) |
 | Hermes Agent | ACP | `pip install hermes-agent && pip install -e '.[acp]'` |
+| AWS DevOps Agent | ACP | Isolated source install + safe launcher; see [Agents](docs/agents.md#aws-devops-agent) |
 
 > ⚠️ `@zed-industries/claude-agent-acp` is deprecated. Use `@agentclientprotocol/claude-agent-acp`.
+
+> AWS DevOps Agent is never enabled by zero-config discovery. Copy its disabled
+> block from `config.yaml.example`, pin/review the upstream source, use a fixed
+> AgentSpace, and keep investigation mode `explicit` unless the human approves otherwise.
 
 ---
 
