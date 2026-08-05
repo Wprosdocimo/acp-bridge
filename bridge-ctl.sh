@@ -110,7 +110,13 @@ case "${1:-status}" in
         warn_orphan_bridge_processes || true
         echo "⏳ Restarting LiteLLM + ACP Bridge..."
         schedule_service_action restart-all /bin/bash -c \
-            "'$SYSTEMCTL' restart '$LITELLM_SERVICE' && sleep 3 && '$SYSTEMCTL' restart '$SERVICE'"
+            "'$SYSTEMCTL' restart '$LITELLM_SERVICE' && \
+             for i in \$(seq 1 30); do \
+                 curl -sf 'http://127.0.0.1:4000/health/liveliness' >/dev/null && break; \
+                 sleep 1; \
+             done && \
+             curl -sf 'http://127.0.0.1:4000/health/liveliness' >/dev/null && \
+             '$SYSTEMCTL' restart '$SERVICE'"
         echo "✅ Restart scheduled. Services will be back shortly."
         ;;
     stop)
