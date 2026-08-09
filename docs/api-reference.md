@@ -101,6 +101,69 @@ Submit a multi-agent pipeline. See [Pipelines](pipelines.md) for full details.
 | `max_turns` | integer | No | Conversation mode only (default: 6, max: 12) |
 | `target` | string | No | Webhook push target |
 | `channel` | string | No | IM channel |
+| `input` | string | No | Fills `{{input}}`; presence enables template rendering |
+| `vars` | object | No | Extra variables, e.g. `{"bucket": "my-bucket"}` |
+| `steps[].artifact` | object | No | Expected output, e.g. `{"type": "file", "label": "GDD", "pattern": "gdd-{{uid}}.md"}` |
+
+#### Template rendering
+
+When `input` or `vars` is present, the Bridge recursively substitutes `{{var}}`
+in every string under `steps` and `context` before execution — so a UI can post
+a template plus variables instead of pre-rendering client-side. Omit both and
+the payload is passed through untouched (backward compatible).
+
+Scope, lowest to highest precedence:
+
+| Variable | Source |
+|----------|--------|
+| `{{uid}}` | Auto — 8 hex chars, unique per submission, identical everywhere in the payload |
+| `{{date}}` | Auto — `YYYY-MM-DD` |
+| `{{input}}` | The `input` field |
+| anything else | `vars` (may also override `uid` / `date` / `input`) |
+
+Rendering is recursive, so nested payloads such as `context.next.steps[].prompt`
+are handled too.
+
+**Unresolved variables return 400.** Unlike `POST /prompts/render`, which leaves
+unknown placeholders in place, a leftover `{{bucket}}` here would make the agent
+really run `aws s3 cp ... s3://{{bucket}}/` and create a literal path. The error
+names each variable and its JSON path:
+
+```json
+{"error": "unresolved variables: {{bucket}} at steps[0].prompt"}
+```
+
+#### Artifacts
+
+`steps[].artifact` declares what a step is expected to produce. The `pattern` is
+rendered like any other string, then stripped from the step before execution.
+`GET /pipelines/{id}` reports each declaration with resolution status — `type:
+file` patterns are globbed against the pipeline's `shared_cwd`.
+
+```bash
+curl -X POST http://localhost:18010/pipelines \
+  -H "Authorization: Bearer $ACP_BRIDGE_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "mode": "sequence",
+    "input": "做个赛车游戏",
+    "vars": {"bucket": "opengame-demo-summit-2026"},
+    "context": {"shared_cwd": "/tmp/opengame"},
+    "steps": [
+      {"agent": "harness", "prompt": "想法：{{input}}，写入 gdd-{{uid}}.md",
+       "artifact": {"type": "file", "label": "GDD", "pattern": "gdd-{{uid}}.md"}},
+      {"agent": "harness", "prompt": "部署到 s3://{{bucket}}/{{uid}}/"}
+    ]
+  }'
+```
+
+Response echoes the generated `uid` and the rendered declarations:
+
+```json
+{"pipeline_id": "...", "status": "pending", "mode": "sequence", "steps": 2,
+ "uid": "3f9a1c02",
+ "artifacts": [{"type": "file", "label": "GDD", "pattern": "gdd-3f9a1c02.md"}]}
+```
 
 ### `GET /pipelines`
 
@@ -108,7 +171,14 @@ List all pipelines.
 
 ### `GET /pipelines/{id}`
 
-Query a single pipeline by ID.
+Query a single pipeline by ID. When the pipeline was submitted with template
+rendering, the response also carries `uid` and a resolved `artifacts` array:
+
+```json
+{"artifacts": [{"step": 0, "agent": "harness", "type": "file", "label": "GDD",
+                "pattern": "gdd-3f9a1c02.md", "exists": true,
+                "path": "/tmp/opengame/gdd-3f9a1c02.md"}]}
+```
 
 ### `GET /stats/pipelines`
 

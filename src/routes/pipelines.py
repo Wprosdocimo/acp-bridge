@@ -9,6 +9,7 @@ from pydantic import BaseModel
 
 from ..pipeline import PipelineManager
 from ..prompt_log import PromptStore, row_to_summary
+from ..render import extract_artifacts, format_missing, render_payload, resolve_artifacts
 
 
 class PipelineStepRequest(BaseModel):
@@ -16,6 +17,10 @@ class PipelineStepRequest(BaseModel):
     prompt: str
     output_as: str = ""
     timeout: float = 0
+    # Optional artifact declaration, e.g.
+    # {"type": "file", "label": "GDD", "pattern": "gdd-{{uid}}.md"}
+    # Stripped from the step before submit and stashed in context._artifacts.
+    artifact: dict | None = None
 
 
 class PipelineRequest(BaseModel):
@@ -25,6 +30,10 @@ class PipelineRequest(BaseModel):
     target: str = ""
     channel: str = ""
     callback_meta: dict = {}
+    # Template rendering (v0.37.0): when either is set, steps+context are
+    # rendered recursively against {uid, date, input, **vars} before submit.
+    input: str = ""
+    vars: dict = {}
     # Conversation mode fields
     participants: list[str] = []
     topic: str = ""
@@ -56,8 +65,22 @@ def register(app, pipeline_mgr: PipelineManager | None,
         else:
             if not req.steps:
                 return JSONResponse({"error": "steps required"}, status_code=400)
-            context = req.context
+            context = req.context.copy()
             steps = req.steps
+        step_dicts = [s.model_dump() for s in steps]
+        # Template rendering: opt-in, skipped entirely when no input/vars given
+        # so pre-rendered payloads behave exactly as before v0.37.0.
+        uid = ""
+        if req.input or req.vars:
+            step_dicts, context, uid, missing = render_payload(
+                step_dicts, context, req.input, req.vars)
+            if missing:
+                return JSONResponse({"error": format_missing(missing)}, status_code=400)
+        artifacts = extract_artifacts(step_dicts)
+        if any(artifacts):
+            context["_artifacts"] = artifacts
+        if uid:
+            context["_uid"] = uid
         meta = req.callback_meta
         if req.target:
             meta["target"] = req.target
@@ -69,11 +92,15 @@ def register(app, pipeline_mgr: PipelineManager | None,
             meta["channel"] = req.channel
         pl = pipeline_mgr.submit(
             mode=req.mode,
-            steps=[s.model_dump() for s in steps],
+            steps=step_dicts,
             context=context,
             webhook_meta=meta,
         )
         resp = {"pipeline_id": pl.pipeline_id, "status": pl.status, "mode": pl.mode}
+        if uid:
+            resp["uid"] = uid
+        if any(artifacts):
+            resp["artifacts"] = [a for a in artifacts if a]
         if req.mode == "conversation":
             resp["participants"] = req.participants
             resp["topic"] = req.topic
@@ -91,6 +118,12 @@ def register(app, pipeline_mgr: PipelineManager | None,
         d = pl.to_dict()
         if pl.mode == "conversation":
             d["transcript"] = pipeline_mgr.get_transcript(pipeline_id)
+        if pl.context.get("_uid"):
+            d["uid"] = pl.context["_uid"]
+        if pl.context.get("_artifacts"):
+            d["artifacts"] = resolve_artifacts(
+                pl.context["_artifacts"], d.get("steps", []),
+                pl.context.get("shared_cwd", ""))
         return d
 
     @app.post("/pipelines/{pipeline_id}/pause")
