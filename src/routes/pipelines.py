@@ -9,7 +9,14 @@ from pydantic import BaseModel
 
 from ..pipeline import PipelineManager
 from ..prompt_log import PromptStore, row_to_summary
-from ..render import extract_artifacts, format_missing, render_payload, resolve_artifacts
+from ..render import (
+    extract_artifacts,
+    extract_chained_artifacts,
+    format_missing,
+    propagate_uid,
+    render_payload,
+    resolve_artifacts,
+)
 
 
 class PipelineStepRequest(BaseModel):
@@ -79,8 +86,14 @@ def register(app, pipeline_mgr: PipelineManager | None,
         artifacts = extract_artifacts(step_dicts)
         if any(artifacts):
             context["_artifacts"] = artifacts
+        # Chained pipelines (context.next) declare their own artifacts. Stash them
+        # where _auto_chain's `next_def["context"].copy()` will pick them up as the
+        # child pipeline's own _artifacts — see src/render.py for why this needs no
+        # change to the protected src/pipeline.py.
+        chained = extract_chained_artifacts(context)
         if uid:
             context["_uid"] = uid
+            propagate_uid(context, uid)
         meta = req.callback_meta
         if req.target:
             meta["target"] = req.target
@@ -101,6 +114,10 @@ def register(app, pipeline_mgr: PipelineManager | None,
             resp["uid"] = uid
         if any(artifacts):
             resp["artifacts"] = [a for a in artifacts if a]
+        if chained:
+            # Chained artifacts belong to the downstream pipeline, whose id does not
+            # exist yet — report the count so a UI knows more output is coming.
+            resp["chained_artifacts"] = chained
         if req.mode == "conversation":
             resp["participants"] = req.participants
             resp["topic"] = req.topic

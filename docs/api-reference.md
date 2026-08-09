@@ -104,6 +104,7 @@ Submit a multi-agent pipeline. See [Pipelines](pipelines.md) for full details.
 | `input` | string | No | Fills `{{input}}`; presence enables template rendering |
 | `vars` | object | No | Extra variables, e.g. `{"bucket": "my-bucket"}` |
 | `steps[].artifact` | object | No | Expected output, e.g. `{"type": "file", "label": "GDD", "pattern": "gdd-{{uid}}.md"}` |
+| `context.next.steps[].artifact` | object | No | Same, for chained downstream pipelines |
 
 #### Template rendering
 
@@ -139,6 +140,16 @@ names each variable and its JSON path:
 rendered like any other string, then stripped from the step before execution.
 `GET /pipelines/{id}` reports each declaration with resolution status — `type:
 file` patterns are globbed against the pipeline's `shared_cwd`.
+
+Declarations inside `context.next.steps[]` are handled too. Because a `next`
+block is executed as a **separate downstream pipeline** with its own id, those
+declarations are attached to that child pipeline rather than this one: the
+submit response reports only a `chained_artifacts` count, and the resolved
+array shows up on `GET /pipelines/{child_id}` (whose id appears as
+`next_pipeline_id` on the parent once the chain fires). The child inherits the
+parent's `uid` and `shared_cwd`, so patterns containing `{{uid}}` resolve
+against the same workspace. Nested `next.next...` chains are handled at any
+depth.
 
 ```bash
 curl -X POST http://localhost:18010/pipelines \

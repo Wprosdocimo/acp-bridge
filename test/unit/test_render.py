@@ -21,7 +21,9 @@ from fastapi import FastAPI
 from src.render import (
     build_scope,
     extract_artifacts,
+    extract_chained_artifacts,
     format_missing,
+    propagate_uid,
     render_payload,
     resolve_artifacts,
 )
@@ -143,12 +145,103 @@ def test_resolve_artifacts_marks_missing_file():
 
 
 # ============================================================================
+# Chained artifacts (v0.38.0) — context.next.steps[].artifact
+# ============================================================================
+
+def test_extract_chained_stashes_where_auto_chain_will_inherit():
+    """_auto_chain does next_def["context"].copy() -> child sees _artifacts."""
+    context = {"next": {"mode": "sequence", "steps": [
+        {"agent": "qwen", "prompt": "sum",
+         "artifact": {"type": "file", "label": "报告", "pattern": "report.md"}},
+        {"agent": "kiro", "prompt": "ppt"},
+    ]}}
+    found = extract_chained_artifacts(context)
+    assert found == 1
+    child = context["next"]["context"]["_artifacts"]
+    assert child[0]["pattern"] == "report.md"
+    assert child[1] is None  # aligned with the child's steps
+    # stripped, so PipelineManager.submit() never sees an unknown key
+    assert all("artifact" not in s for s in context["next"]["steps"])
+
+
+def test_extract_chained_simulates_auto_chain_inheritance():
+    """Replicates src/pipeline.py:_auto_chain context construction verbatim."""
+    context = {"shared_cwd": "/tmp/opengame", "next": {"mode": "sequence", "steps": [
+        {"agent": "qwen", "prompt": "sum",
+         "artifact": {"type": "file", "label": "报告", "pattern": "report.md"}},
+    ]}}
+    extract_chained_artifacts(context)
+    propagate_uid(context, "deadbeef")
+
+    next_def = context["next"]
+    next_context = next_def.get("context", {}).copy()
+    next_context.setdefault("shared_cwd", context.get("shared_cwd", ""))
+
+    assert next_context["_artifacts"][0]["pattern"] == "report.md"
+    assert next_context["_uid"] == "deadbeef"
+    assert next_context["shared_cwd"] == "/tmp/opengame"
+
+
+def test_extract_chained_recurses_through_nested_next():
+    context = {"next": {
+        "mode": "sequence",
+        "steps": [{"agent": "a", "prompt": "x",
+                   "artifact": {"type": "file", "pattern": "a.md"}}],
+        "next": {"mode": "sequence",
+                 "steps": [{"agent": "b", "prompt": "y",
+                            "artifact": {"type": "url", "pattern": "https://d/"}}]},
+    }}
+    assert extract_chained_artifacts(context) == 2
+    assert context["next"]["context"]["_artifacts"][0]["pattern"] == "a.md"
+    assert context["next"]["next"]["context"]["_artifacts"][0]["pattern"] == "https://d/"
+
+
+def test_extract_chained_is_noop_without_next():
+    context = {"shared_cwd": "/tmp/x"}
+    assert extract_chained_artifacts(context) == 0
+    assert context == {"shared_cwd": "/tmp/x"}
+
+
+def test_extract_chained_leaves_no_context_key_when_no_artifacts():
+    context = {"next": {"mode": "sequence", "steps": [{"agent": "a", "prompt": "x"}]}}
+    assert extract_chained_artifacts(context) == 0
+    assert "_artifacts" not in context["next"].get("context", {})
+
+
+def test_chained_patterns_are_rendered_before_extraction():
+    """render_payload runs first, so extracted patterns carry the real uid."""
+    context = {"next": {"mode": "sequence", "steps": [
+        {"agent": "light-agent", "prompt": "deploy",
+         "artifact": {"type": "url", "label": "PPT",
+                      "pattern": "https://cdn/reports/{{uid}}/"}},
+    ]}}
+    _steps, context, uid, _missing = render_payload([], context, "x", {})
+    extract_chained_artifacts(context)
+    assert context["next"]["context"]["_artifacts"][0]["pattern"] == \
+        f"https://cdn/reports/{uid}/"
+
+
+def test_propagate_uid_reaches_every_chain_level():
+    context = {"next": {"mode": "sequence", "steps": [],
+                        "next": {"mode": "sequence", "steps": []}}}
+    propagate_uid(context, "cafe1234")
+    assert context["next"]["context"]["_uid"] == "cafe1234"
+    assert context["next"]["next"]["context"]["_uid"] == "cafe1234"
+
+
+def test_propagate_uid_ignores_empty_uid():
+    context = {"next": {"mode": "sequence", "steps": []}}
+    propagate_uid(context, "")
+    assert "context" not in context["next"]
+
+
+# ============================================================================
 # Route wiring
 # ============================================================================
 
 class _FakePipeline:
-    def __init__(self, mode, steps, context):
-        self.pipeline_id = "pl-test"
+    def __init__(self, mode, steps, context, pipeline_id="pl-test"):
+        self.pipeline_id = pipeline_id
         self.status = "pending"
         self.mode = mode
         self.steps = steps
@@ -165,14 +258,22 @@ class _FakePipelineManager:
     def __init__(self):
         self.submitted = None
         self.pipeline = None
+        self._all = {}
 
     def submit(self, mode, steps, context=None, webhook_meta=None):
-        self.submitted = {"mode": mode, "steps": steps, "context": context or {}}
-        self.pipeline = _FakePipeline(mode, steps, context or {})
-        return self.pipeline
+        # First submit is the parent (id pl-test, what most assertions read);
+        # later ones simulate _auto_chain children.
+        pid = "pl-test" if not self._all else f"pl-child-{len(self._all)}"
+        if pid == "pl-test":
+            self.submitted = {"mode": mode, "steps": steps, "context": context or {}}
+        pl = _FakePipeline(mode, steps, context or {}, pid)
+        if pid == "pl-test":
+            self.pipeline = pl
+        self._all[pid] = pl
+        return pl
 
     def get(self, pipeline_id):
-        return self.pipeline if self.pipeline else None
+        return self._all.get(pipeline_id)
 
     def get_transcript(self, pipeline_id):
         return []
@@ -315,3 +416,154 @@ async def test_conversation_mode_renders_topic_and_initial_context():
     ctx = mgr.submitted["context"]
     assert ctx["topic"] == "debate: microservices vs monolith"
     assert ctx["initial_context"] == f"style=socratic, run={uid}"
+
+
+# ============================================================================
+# Route wiring — real agent-space artifacts.json payload shapes (v0.38.0)
+# ============================================================================
+
+@pytest.mark.asyncio
+async def test_route_handles_make_game_shape_all_artifacts_top_level():
+    """artifacts.json `make-game`: sequence, 3 artifacts on top-level steps."""
+    app, mgr = _app()
+    resp = await _post(app, {
+        "mode": "sequence",
+        "input": "赛车游戏",
+        "context": {"shared_cwd": "/tmp/opengame"},
+        "steps": [
+            {"agent": "harness", "prompt": "想法：{{input}}，写 gdd.md",
+             "artifact": {"type": "file", "label": "GDD", "pattern": "gdd.md"}},
+            {"agent": "opengame", "prompt": "实现为 {{uid}}.html",
+             "artifact": {"type": "file", "label": "游戏文件",
+                          "pattern": "{{uid}}.html"}},
+            {"agent": "kiro", "prompt": "部署 {{uid}}.html",
+             "artifact": {"type": "url", "label": "URL",
+                          "pattern": "https://d1x0y8igxbg2j0.cloudfront.net"}},
+        ],
+    })
+    assert resp.status_code == 200
+    body = resp.json()
+    uid = body["uid"]
+    assert len(body["artifacts"]) == 3
+    assert body["artifacts"][1]["pattern"] == f"{uid}.html"
+    assert "chained_artifacts" not in body
+    assert mgr.submitted["context"]["_artifacts"][1]["pattern"] == f"{uid}.html"
+    assert all("artifact" not in s for s in mgr.submitted["steps"])
+
+
+@pytest.mark.asyncio
+async def test_route_handles_stock_research_shape_artifacts_only_in_chain():
+    """artifacts.json `stock-research`: parallel, all 3 artifacts in context.next."""
+    app, mgr = _app()
+    resp = await _post(app, {
+        "mode": "parallel",
+        "input": "贵州茅台",
+        "context": {"next": {"mode": "sequence", "inject_upstream": "text", "steps": [
+            {"agent": "qwen", "prompt": "汇总",
+             "artifact": {"type": "file", "label": "报告", "pattern": "report.md"}},
+            {"agent": "kiro", "prompt": "做 PPT",
+             "artifact": {"type": "file", "label": "PPT", "pattern": "ppt.html"}},
+            {"agent": "light-agent", "prompt": "部署 {{uid}}",
+             "artifact": {"type": "url", "label": "PPT",
+                          "pattern": "https://cdn/reports/{{uid}}/"}},
+        ]}},
+        "steps": [{"agent": "kiro-stock", "prompt": "基本面 {{input}}"},
+                  {"agent": "kiro-stock", "prompt": "技术面 {{input}}"}],
+    })
+    assert resp.status_code == 200
+    body = resp.json()
+    uid = body["uid"]
+    assert "artifacts" not in body           # nothing on the top-level steps
+    assert body["chained_artifacts"] == 3    # but the chain declares 3
+    ctx = mgr.submitted["context"]
+    assert "_artifacts" not in ctx
+    child = ctx["next"]["context"]["_artifacts"]
+    assert [a["pattern"] for a in child] == \
+        ["report.md", "ppt.html", f"https://cdn/reports/{uid}/"]
+    assert child[2]["pattern"] == f"https://cdn/reports/{uid}/"
+    assert ctx["next"]["context"]["_uid"] == uid
+    # the child pipeline's steps must be clean for PipelineManager.submit()
+    assert all("artifact" not in s for s in ctx["next"]["steps"])
+    assert mgr.submitted["steps"][0]["prompt"] == "基本面 贵州茅台"
+
+
+@pytest.mark.asyncio
+async def test_route_handles_brainstorm_shape_conversation_plus_chain():
+    """artifacts.json `brainstorm`: conversation, 1 artifact in context.next."""
+    app, mgr = _app()
+    resp = await _post(app, {
+        "mode": "conversation",
+        "input": "AI agent 的未来",
+        "participants": ["kiro", "claude"],
+        "topic": "{{input}}",
+        "context": {"next": {"mode": "sequence", "inject_upstream": "text", "steps": [
+            {"agent": "light-agent", "prompt": "总结并上传 {{uid}}.md",
+             "artifact": {"type": "url", "label": "📄 总结",
+                          "pattern": "https://cdn/reports/"}},
+        ]}},
+    })
+    assert resp.status_code == 200
+    body = resp.json()
+    uid = body["uid"]
+    assert body["chained_artifacts"] == 1
+    ctx = mgr.submitted["context"]
+    assert ctx["topic"] == "AI agent 的未来"
+    assert ctx["next"]["context"]["_artifacts"][0]["label"] == "📄 总结"
+    assert ctx["next"]["context"]["_uid"] == uid
+    assert ctx["next"]["steps"][0]["prompt"] == f"总结并上传 {uid}.md"
+
+
+@pytest.mark.asyncio
+async def test_route_chained_artifacts_work_without_rendering():
+    """Chain extraction is independent of input/vars — pre-rendered payloads too."""
+    app, mgr = _app()
+    resp = await _post(app, {
+        "mode": "parallel",
+        "steps": [{"agent": "a", "prompt": "x"}],
+        "context": {"next": {"mode": "sequence", "steps": [
+            {"agent": "qwen", "prompt": "sum",
+             "artifact": {"type": "file", "label": "R", "pattern": "report.md"}},
+        ]}},
+    })
+    assert resp.status_code == 200
+    assert resp.json()["chained_artifacts"] == 1
+    assert "uid" not in resp.json()
+    ctx = mgr.submitted["context"]
+    assert ctx["next"]["context"]["_artifacts"][0]["pattern"] == "report.md"
+    assert "_uid" not in ctx["next"].get("context", {})
+
+
+@pytest.mark.asyncio
+async def test_get_child_pipeline_resolves_inherited_artifacts():
+    """The child pipeline's own GET resolves what it inherited from the chain."""
+    app, mgr = _app()
+    cwd = tempfile.mkdtemp()
+    resp = await _post(app, {
+        "mode": "parallel",
+        "input": "贵州茅台",
+        "context": {"shared_cwd": cwd, "next": {"mode": "sequence", "steps": [
+            {"agent": "qwen", "prompt": "汇总",
+             "artifact": {"type": "file", "label": "报告",
+                          "pattern": "report-{{uid}}.md"}},
+        ]}},
+        "steps": [{"agent": "kiro-stock", "prompt": "{{input}}"}],
+    })
+    uid = resp.json()["uid"]
+
+    # Simulate _auto_chain building + submitting the child pipeline
+    next_def = mgr.submitted["context"]["next"]
+    child_ctx = next_def["context"].copy()
+    child_ctx.setdefault("shared_cwd", mgr.submitted["context"]["shared_cwd"])
+    child = mgr.submit(next_def["mode"], next_def["steps"], child_ctx)
+
+    with open(os.path.join(cwd, f"report-{uid}.md"), "w") as f:
+        f.write("done")
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+        got = await c.get(f"/pipelines/{child.pipeline_id}")
+    body = got.json()
+    assert body["uid"] == uid
+    assert body["artifacts"][0]["label"] == "报告"
+    assert body["artifacts"][0]["exists"] is True
+    assert body["artifacts"][0]["path"].endswith(f"report-{uid}.md")

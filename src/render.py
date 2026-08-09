@@ -75,6 +75,45 @@ def extract_artifacts(steps: list) -> list:
     return [s.pop("artifact", None) or None for s in steps]
 
 
+def extract_chained_artifacts(context: dict) -> int:
+    """Pop `artifact` off `context.next.steps[]`, recursing through nested `next`.
+
+    Auto-chained pipelines are submitted by `PipelineManager._auto_chain()`,
+    which builds the child context as `next_def["context"].copy()` — so stashing
+    the declarations under `context.next.context._artifacts` makes the child
+    pipeline inherit them as its own `context._artifacts`, which
+    `GET /pipelines/{id}` already knows how to resolve. No change to
+    src/pipeline.py is needed.
+
+    Returns the number of declarations found across the whole chain.
+    """
+    found = 0
+    nxt = context.get("next")
+    while isinstance(nxt, dict):
+        steps = nxt.get("steps")
+        if isinstance(steps, list):
+            artifacts = extract_artifacts([s for s in steps if isinstance(s, dict)])
+            if any(artifacts):
+                child_ctx = nxt.setdefault("context", {})
+                if isinstance(child_ctx, dict):
+                    child_ctx["_artifacts"] = artifacts
+                    found += sum(1 for a in artifacts if a)
+        nxt = nxt.get("next")
+    return found
+
+
+def propagate_uid(context: dict, uid: str) -> None:
+    """Make every chained child pipeline inherit `_uid` for readback."""
+    if not uid:
+        return
+    nxt = context.get("next")
+    while isinstance(nxt, dict):
+        child_ctx = nxt.setdefault("context", {})
+        if isinstance(child_ctx, dict):
+            child_ctx["_uid"] = uid
+        nxt = nxt.get("next")
+
+
 def resolve_artifacts(artifacts: list, steps: list, shared_cwd: str = "") -> list:
     """Pair artifact declarations with step outcomes for API readback.
 
