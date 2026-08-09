@@ -34,6 +34,11 @@ security:
   auth_token: "${ACP_BRIDGE_TOKEN}"             # required, non-empty Bearer token
   allowed_ips:                                  # IP allowlist
     - "127.0.0.1"
+  allowed_private_targets: []                   # SSRF guard allowlist (hostnames/CIDRs) for
+                                                 # client-supplied jobs.callback_url and mesh
+                                                 # ws_in/ws_out — never covers metadata targets;
+                                                 # the configured webhook.url is exempt.
+                                                 # See docs/security.md#ssrf-protection
 
 litellm:
   url: "http://localhost:4000"                  # LiteLLM proxy URL
@@ -167,7 +172,7 @@ Mesh discovery is opt-in. When `mesh.enabled` is omitted or false, Bridge regist
 | `self_url` | Backward-compat fallback; used when `mode` is not set |
 | `announce_interval` | Seconds between peer announcements; peers unseen for `3 * interval` are marked unhealthy |
 | `max_hops` | Reserved gossip depth field for future expansion |
-| `token` | Bearer token for `/a2a/announce`; separate from `ACP_BRIDGE_TOKEN` |
+| `token` | Bearer token for `/a2a/announce` and `/a2a`; separate from `ACP_BRIDGE_TOKEN`. **Required (non-empty) when `enabled: true`** — Bridge refuses to start otherwise, since these two endpoints get no auth from the global Bearer middleware |
 | `seeds` | Initial peer URLs to announce to |
 | `pricing` | Declared pricing metadata; L0 uses `free` and does not bill |
 

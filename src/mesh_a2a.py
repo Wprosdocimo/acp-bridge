@@ -12,6 +12,8 @@ import logging
 
 from acp_sdk.models import Message, MessagePart
 
+from .url_safety import UnsafeUrlError, validate_outbound_url
+
 log = logging.getLogger("acp-bridge.mesh.a2a")
 
 FREE_COST = {"amount": 0, "currency": "USD"}
@@ -54,11 +56,13 @@ async def _drain(agent, input: list[Message]) -> str:
 class A2AAdapter:
     """Dispatches A2A JSON-RPC methods against this node's local agents + job store."""
 
-    def __init__(self, agents_provider, job_mgr=None, remote_skills=None, pool=None):
+    def __init__(self, agents_provider, job_mgr=None, remote_skills=None, pool=None,
+                 allowed_private_targets: frozenset[str] = frozenset()):
         # agents_provider: callable -> {name: Agent}; deferred so app.state is ready.
         self._agents_provider = agents_provider
         self._job_mgr = job_mgr
         self._pool = pool  # L3: needed to run a local agent with an explicit cwd
+        self._allowed_private_targets = allowed_private_targets
         # L2: names registered as a2a-remote handlers (forward to a peer). Used to
         # enforce the 1-hop limit: an inbound hopped request must not re-forward.
         self.remote_skills = remote_skills if remote_skills is not None else set()
@@ -109,16 +113,36 @@ class A2AAdapter:
 
     async def _tasks_send_workspace(self, rpc_id, skill, params, ws_in, ws_out) -> dict:
         """L3 (B side): download workspace → run agent with that cwd → upload result."""
+        if self._pool is None:
+            return _rpc_error(rpc_id, -32010, "workspace step requires a process pool")
+        # Validate before anything else — including the imports below, which
+        # pull in the agent-execution machinery. Untrusted ws_in/ws_out never
+        # get that far if they're unsafe. Each SafeTarget pins the exact IP
+        # validated here; the httpx calls below connect to that IP directly
+        # rather than re-resolving the hostname, closing the DNS-rebinding
+        # TOCTOU a separate validate-then-fetch would leave open.
+        try:
+            ws_in_target = validate_outbound_url(ws_in, allowed_targets=self._allowed_private_targets)
+            ws_out_target = (
+                validate_outbound_url(ws_out, allowed_targets=self._allowed_private_targets)
+                if ws_out else None
+            )
+        except UnsafeUrlError as e:
+            return _rpc_error(rpc_id, -32014, f"unsafe workspace url: {e}")
         import tempfile, uuid
         import httpx
         from src import s3 as _s3
         from src.agents import _call_acp_agent_internal
-        if self._pool is None:
-            return _rpc_error(rpc_id, -32010, "workspace step requires a process pool")
         prompt = "".join(p.get("text", "") for p in (params.get("message") or {}).get("parts", []))
         tmp = tempfile.mkdtemp(prefix="mesh-ws-")
         try:
-            r = httpx.get(ws_in, timeout=120)
+            # httpx's module-level get/put accept no `extensions`, so pinning
+            # requires a real Client. follow_redirects stays off so a 30x can't
+            # escape the validated IP — see url_safety.py.
+            with httpx.Client(timeout=120, follow_redirects=False) as c:
+                r = c.get(ws_in_target.pinned_url,
+                          headers={"Host": ws_in_target.host_header},
+                          extensions={"sni_hostname": ws_in_target.host})
             r.raise_for_status()
             _s3.unpack_dir(r.content, tmp)
         except Exception as e:
@@ -134,9 +158,12 @@ class A2AAdapter:
         except Exception as e:
             log.warning("a2a workspace step failed skill=%s err=%s", skill, e)
             return _rpc_error(rpc_id, -32000, f"agent error: {e}")
-        if ws_out:
+        if ws_out_target:
             try:
-                httpx.put(ws_out, content=_s3.pack_dir(tmp), timeout=120).raise_for_status()
+                with httpx.Client(timeout=120, follow_redirects=False) as c:
+                    c.put(ws_out_target.pinned_url, content=_s3.pack_dir(tmp),
+                          headers={"Host": ws_out_target.host_header},
+                          extensions={"sni_hostname": ws_out_target.host}).raise_for_status()
             except Exception as e:
                 return _rpc_error(rpc_id, -32013, f"workspace upload failed: {e}")
         return _rpc_result(rpc_id, {
