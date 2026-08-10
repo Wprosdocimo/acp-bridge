@@ -86,6 +86,25 @@ class AcpConnection:
         self.proc.stdin.write(data.encode())
         asyncio.ensure_future(self.proc.stdin.drain())
 
+    @staticmethod
+    def _pick_always_allow_option(options: list) -> str:
+        """Pick the optionId meaning "always allow" from a request_permission
+        options list, instead of guessing a hardcoded literal.
+
+        Different ACP agents mint their own optionId strings for the same
+        semantic choice — claude-agent-acp (v0.65.0) sends
+        {kind: "allow_always", optionId: "allow_always"}, not the
+        "proceed_always" this bridge used to hardcode unconditionally, which
+        matches no option Claude offers and gets silently treated as a
+        denial. `kind` is the stable, agent-agnostic field per the ACP spec;
+        `optionId` is the opaque value that must be echoed back.
+        """
+        by_kind = {opt.get("kind"): opt.get("optionId") for opt in options if isinstance(opt, dict)}
+        for kind in ("allow_always", "allow_once"):
+            if by_kind.get(kind):
+                return by_kind[kind]
+        return "proceed_always"
+
     def _auto_reply_error(self, msg_id: int, code: int, message: str) -> None:
         reply = {"jsonrpc": "2.0", "id": msg_id, "error": {"code": code, "message": message}}
         data = json.dumps(reply) + "\n"
@@ -133,8 +152,9 @@ class AcpConnection:
                     if msg.get("method") == "session/request_permission" and msg_id is not None:
                         log.info("auto-allow permission: %s",
                                  msg.get("params", {}).get("toolCall", {}).get("title", "?"))
+                        option_id = self._pick_always_allow_option(msg.get("params", {}).get("options", []))
                         self._auto_reply(msg_id, {"outcome": {"outcome": "selected",
-                                                              "optionId": "proceed_always"}})
+                                                              "optionId": option_id}})
                     # Auto-reply fs requests (e.g. opengame ACP)
                     elif msg.get("method") == "fs/read_text_file" and msg_id is not None:
                         path = msg.get("params", {}).get("path", "")
