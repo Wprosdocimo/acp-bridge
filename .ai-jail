@@ -1,0 +1,29 @@
+# ai-jail sandbox configuration for acp-bridge
+# https://github.com/akitaonrails/ai-jail
+# Edit freely. Regenerate with: ai-jail --clean --init
+
+# Default (non --private-home) mode auto-discovers every dotdir under $HOME
+# and mounts it individually: read-write if it's a known tool-state dir
+# (verified live via `ai-jail --dry-run`: .config, .cache, .claude, .kiro,
+# .cargo, .local/share/{mise,kiro-cli,opencode,uv,pipx,ai-memory,...} etc.
+# all come back `--bind` already), read-only otherwise, and .aws/.ssh/.gnupg
+# are never mounted at all (built-in DOTDIR_DENY, confirmed absent from the
+# dry-run output). This covers every harness this bridge spawns except one:
+
+rw_maps = [
+    # cursor-agent (pty-mode harness, see config.yaml) writes session/chat
+    # state under ~/.cursor (cli-config.json, chats/, projects/) — comes
+    # back read-only by default since it's not in ai-jail's built-in
+    # writable-dotdir list. ~/.config/cursor (auth.json) is already RW via
+    # the native `.config` passthrough, no extra entry needed for that one.
+    "~/.cursor",
+]
+
+# No secrets tracked in this repo tree (checked 2026-08-10: no .env, the only
+# credential-bearing file is config.yaml itself — gitignored, holds this
+# bridge's own auth_token — which must stay readable, it's the bridge's own
+# config, not a secret to hide from itself).
+
+no_docker = true
+no_gpu = true
+no_display = true

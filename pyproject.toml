@@ -14,3 +14,10 @@ dependencies = [
 
 [tool.setuptools.dynamic]
 version = {file = "VERSION"}
+
+[tool.uv]
+# acp-sdk 1.0.3 (only published version as of 2026-08) doesn't pin a compatible
+# uvicorn range; uvicorn>=0.36 renamed config.LoopSetupType -> LoopFactoryType,
+# breaking acp_sdk.server.server's import. Pin below the rename until acp-sdk
+# fixes its own constraint upstream.
+override-dependencies = ["uvicorn<0.36"]
