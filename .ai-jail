@@ -17,12 +17,57 @@ rw_maps = [
     # writable-dotdir list. ~/.config/cursor (auth.json) is already RW via
     # the native `.config` passthrough, no extra entry needed for that one.
     "~/.cursor",
+
+    # Job callers pass an arbitrary `cwd` (e.g. mcp-server/server.py's
+    # acp_call/acp_submit_job tools) so a spawned harness can operate on any
+    # of the user's actual repos, not just this bridge's own directory.
+    # Confirmed live 2026-08-10: a real job with cwd set to a path under
+    # /mnt/wsl/PhysicalDrive3p1/Projects/Playground still ran fully isolated
+    # — ai-jail only mounts the *bridge's own* project dir by default, so
+    # os.makedirs(cwd) inside jobs.py silently created a private, empty
+    # sandbox-local directory at that path instead of seeing the real repo.
+    # Mounting the whole Projects tree (not just Playground) so any repo
+    # under it is reachable, matching the bridge's actual use case: routing
+    # work to arbitrary harnesses across all of the user's projects.
+    "/mnt/wsl/PhysicalDrive3p1/Projects",
 ]
 
-# No secrets tracked in this repo tree (checked 2026-08-10: no .env, the only
-# credential-bearing file is config.yaml itself — gitignored, holds this
-# bridge's own auth_token — which must stay readable, it's the bridge's own
-# config, not a secret to hide from itself).
+# No secrets tracked in acp-bridge's own repo tree (checked 2026-08-10: no
+# .env, the only credential-bearing file is config.yaml itself — gitignored,
+# holds this bridge's own auth_token — which must stay readable, it's the
+# bridge's own config, not a secret to hide from itself).
+#
+# The Projects mount above is a different story: it now exposes every repo
+# under it, including Playground, which has its own real secrets (root
+# .env, .devcontainer/.env, tasks/138786/secrets_em_config.md,
+# tasks/145186/env-backup/*.env — see Playground's own .ai-jail, written
+# 2026-08-05). That file's deny_paths don't apply here — this is a separate
+# sandbox config for a separate process — so the same repo-agnostic globs
+# are repeated below to cover secrets in Playground or any other repo under
+# Projects a harness might be pointed at via `cwd`.
+deny_paths = [
+    "**/.env",
+    "**/.env.*",
+    "**/*.env",
+    "**/secrets_*",
+    "**/*secret*",
+    "**/*credentials*",
+]
+
+# The globs above are broad enough to match legitimate library source files
+# by coincidence once they apply across every repo's dependency tree, not
+# just Playground: e.g. redis/credentials.py, botocore/data/secretsmanager,
+# pydantic_settings/.../secrets.py. Confirmed live 2026-08-10 — masking
+# redis/credentials.py inside acp-bridge's own .venv broke the bridge's own
+# startup import (PermissionError on `from redis.credentials import ...`).
+# Exempt installed-dependency directories; the goal is hiding project-authored
+# secrets, not library code that happens to share a name.
+deny_path_exceptions = [
+    "**/.venv/**",
+    "**/node_modules/**",
+    "**/site-packages/**",
+    "**/.git/**",
+]
 
 no_docker = true
 no_gpu = true
