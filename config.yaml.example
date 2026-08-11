@@ -13,6 +13,13 @@ pool:
   max_per_agent: 10
   acquire_timeout: 60                           # seconds to wait for a free slot when pool is full; 0 = fail fast
 
+# SQLite data retention (v0.41.0) — pruned every 60s by the cleanup loop.
+# prompt_log retention is configured separately via prompt_log.retention_days.
+retention:
+  pipelines_days: 7                             # pipelines + events + conversation transcripts
+  chat_days: 7                                  # Web UI chat messages
+  llm_usage_days: 30                            # /usage LLM token records (usage.db)
+
 harness:
   binary: ""                                    # absolute path to harness-factory binary; empty = disabled
 

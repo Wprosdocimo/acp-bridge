@@ -24,6 +24,12 @@ pool:
   memory_limit_percent: 80                      # OOM eviction threshold (system memory %)
   acquire_timeout: 60                           # wait up to N seconds for a free slot when pool is full; 0 = fail fast (v0.40.0)
 
+retention:                                      # SQLite pruning, runs every 60s (v0.41.0)
+  pipelines_days: 7                             # pipelines + events + conversation transcripts
+  chat_days: 7                                  # Web UI chat messages
+  llm_usage_days: 30                            # /usage LLM token records (usage.db)
+                                                # prompt_log retention: prompt_log.retention_days
+
 webhook:
   url: "http://<openclaw-ip>:18789/tools/invoke"  # callback endpoint
   token: "${OPENCLAW_TOKEN}"                    # Bearer auth (openclaw)

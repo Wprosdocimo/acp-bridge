@@ -1,5 +1,6 @@
 """LiteLLM proxy — transparent pass-through with usage recording."""
 
+import asyncio
 import json
 import logging
 import sqlite3
@@ -33,6 +34,7 @@ CREATE INDEX IF NOT EXISTS idx_usage_ts ON llm_usage(ts);
 def _get_db():
     Path(_DB_PATH).parent.mkdir(parents=True, exist_ok=True)
     db = sqlite3.connect(_DB_PATH, check_same_thread=False)
+    db.execute("PRAGMA journal_mode=WAL")
     db.row_factory = sqlite3.Row
     db.executescript(_SCHEMA)
     return db
@@ -46,6 +48,14 @@ def _ensure_db():
     if _db is None:
         _db = _get_db()
     return _db
+
+
+def delete_old(max_age: float = 30 * 86400) -> int:
+    """Prune llm_usage rows older than max_age seconds. Called by main's cleanup loop."""
+    db = _ensure_db()
+    cur = db.execute("DELETE FROM llm_usage WHERE ts < ?", (time.time() - max_age,))
+    db.commit()
+    return cur.rowcount
 
 
 def _record_usage(model: str, usage: dict, duration: float):
@@ -68,6 +78,8 @@ def _record_usage(model: str, usage: dict, duration: float):
 def register(app, litellm_cfg: dict):
     url = litellm_cfg.get("url", "http://localhost:4000")
     api_key = litellm_cfg.get("env", {}).get("LITELLM_API_KEY", "")
+    # Reused client (connection pooling) — same pattern as routes/tools.py.
+    client = httpx.AsyncClient(timeout=120)
 
     @app.api_route("/litellm/{path:path}", methods=["GET", "POST"])
     async def litellm_proxy(request: Request, path: str):
@@ -75,12 +87,11 @@ def register(app, litellm_cfg: dict):
         target = f"{url}/{path}"
         headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
         t0 = time.time()
-        async with httpx.AsyncClient(timeout=120) as client:
-            if request.method == "GET":
-                resp = await client.get(target, headers=headers, params=dict(request.query_params))
-            else:
-                body = await request.body()
-                resp = await client.post(target, headers=headers, content=body)
+        if request.method == "GET":
+            resp = await client.get(target, headers=headers, params=dict(request.query_params))
+        else:
+            body = await request.body()
+            resp = await client.post(target, headers=headers, content=body)
         duration = time.time() - t0
         try:
             data = resp.json()
@@ -202,14 +213,16 @@ def register(app, litellm_cfg: dict):
                 except Exception:
                     pass
             try:
-                db = _ensure_db()
-                db.execute(
-                    """INSERT INTO llm_usage (ts, model, input_tokens, output_tokens, total_tokens,
-                       cached_tokens, cache_creation_tokens, duration)
-                       VALUES (?,?,?,?,?,?,?,?)""",
-                    (time.time(), model, input_tokens, output_tokens, total_tokens,
-                     cached, cache_creation, duration))
-                db.commit()
+                def _insert(m=model, it=input_tokens, ot=output_tokens,
+                            tt=total_tokens, c=cached, cc=cache_creation, d=duration):
+                    db = _ensure_db()
+                    db.execute(
+                        """INSERT INTO llm_usage (ts, model, input_tokens, output_tokens, total_tokens,
+                           cached_tokens, cache_creation_tokens, duration)
+                           VALUES (?,?,?,?,?,?,?,?)""",
+                        (time.time(), m, it, ot, tt, c, cc, d))
+                    db.commit()
+                await asyncio.to_thread(_insert)
                 recorded += 1
             except Exception as e:
                 log.warning("callback_record_failed: %s", e)

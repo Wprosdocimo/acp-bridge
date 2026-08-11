@@ -8,18 +8,28 @@ import yaml
 _TEMPLATES_DIR = Path(__file__).resolve().parent.parent / "prompts" / "templates"
 _VAR_RE = re.compile(r"\{\{(\w+)\}\}")
 
+# mtime-keyed cache: reparse only when a template file is added/removed/edited
+_cache: dict[str, dict] = {}
+_cache_key: tuple = ()
+
 
 def _load_all() -> dict[str, dict]:
-    templates = {}
+    global _cache, _cache_key
     if not _TEMPLATES_DIR.exists():
-        return templates
-    for f in _TEMPLATES_DIR.glob("*.yaml"):
+        return {}
+    files = sorted(_TEMPLATES_DIR.glob("*.yaml"))
+    key = tuple((str(f), f.stat().st_mtime) for f in files)
+    if key == _cache_key:
+        return _cache
+    templates = {}
+    for f in files:
         try:
             t = yaml.safe_load(f.read_text())
             if t and t.get("name"):
                 templates[t["name"]] = t
         except Exception:
             continue
+    _cache, _cache_key = templates, key
     return templates
 
 

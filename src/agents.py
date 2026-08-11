@@ -123,7 +123,7 @@ async def _execute_agent_call(
     except (PoolExhaustedError, AcpError) as e:
         log.error("agent_init_failed: agent=%s error=%s", agent_name, e)
         if _stats:
-            _stats.record(agent_name, session_id, False, 0)
+            await asyncio.to_thread(_stats.record, agent_name, session_id, False, 0)
         raise
 
     _t0 = time.time()
@@ -154,7 +154,8 @@ async def _execute_agent_call(
                          agent_name, session_id,
                          notification["_prompt_result"].get("result", {}).get("stopReason", "?"))
                 # Record any usage included with both successful and failed responses.
-                _record_acp_usage(agent_name, notification["_prompt_result"], time.time() - _t0)
+                await asyncio.to_thread(
+                    _record_acp_usage, agent_name, notification["_prompt_result"], time.time() - _t0)
                 if "error" in notification["_prompt_result"]:
                     error = notification["_prompt_result"]["error"]
                     message = error.get("message", str(error)) if isinstance(error, dict) else str(error)
@@ -193,13 +194,15 @@ async def _execute_agent_call(
                 results.append(MessagePart(content=f"[status] {event['text']}\n", content_type="text/plain"))
 
         if _stats:
-            _stats.record(agent_name, session_id, _success, time.time() - _t0, _tools_used)
+            await asyncio.to_thread(
+                _stats.record, agent_name, session_id, _success, time.time() - _t0, _tools_used)
 
     except Exception as e:
         log.error("agent_crashed: agent=%s session=%s error=%s", agent_name, session_id, e)
         await pool.remove(agent_name, session_id)
         if _stats:
-            _stats.record(agent_name, session_id, False, time.time() - _t0, _tools_used)
+            await asyncio.to_thread(
+                _stats.record, agent_name, session_id, False, time.time() - _t0, _tools_used)
         # Classify for smart retry
         msg = str(e).lower()
         if isinstance(e, (AgentTimeoutError, AgentRateLimitError, AgentModelError)):
@@ -376,7 +379,8 @@ def make_acp_agent_handler(agent_name: str, pool: AcpProcessPool, profile: dict 
                     )])
                     log.info("fallback_success: original=%s fallback=%s", original_agent, current_agent)
                     if _stats:
-                        _stats.record_fallback(original_agent, current_agent, tried_agents, True)
+                        await asyncio.to_thread(
+                            _stats.record_fallback, original_agent, current_agent, tried_agents, True)
                 return
 
             except AgentTimeoutError:
@@ -412,7 +416,8 @@ def make_acp_agent_handler(agent_name: str, pool: AcpProcessPool, profile: dict 
                 if attempt >= MAX_FALLBACK_ATTEMPTS - 1:
                     log.error("fallback_exhausted: agent=%s tried=%s",
                              original_agent, tried_agents)
-                    _record_fallback_failure(original_agent, session_id, tried_agents, current_agent)
+                    await asyncio.to_thread(
+                        _record_fallback_failure, original_agent, session_id, tried_agents, current_agent)
                     yield Message(parts=[MessagePart(
                         content=fmt("agent", "fallback_exhausted",
                                    "[error] all fallback agents unavailable (tried: {})",
@@ -421,11 +426,15 @@ def make_acp_agent_handler(agent_name: str, pool: AcpProcessPool, profile: dict 
                     router_span.finish(success=False, error_type="fallback_exhausted")
                     return
 
-                next_agent = get_best_fallback(current_agent, tried_agents, pool, _stats)
+                # Fallback scoring runs sync SQLite queries per candidate —
+                # keep them off the loop during failure storms.
+                next_agent = await asyncio.to_thread(
+                    get_best_fallback, current_agent, tried_agents, pool, _stats)
                 if next_agent is None:
                     log.error("no_fallback_available: agent=%s tried=%s",
                              original_agent, tried_agents)
-                    _record_fallback_failure(original_agent, session_id, tried_agents, current_agent)
+                    await asyncio.to_thread(
+                        _record_fallback_failure, original_agent, session_id, tried_agents, current_agent)
                     yield Message(parts=[MessagePart(
                         content=fmt("agent", "no_fallback",
                                    "[error] no fallback available for {} (tried: {})",
@@ -507,7 +516,7 @@ def make_pty_agent_handler(agent_cfg: dict, verbose: bool = False):
                     proc.kill()
                     await proc.wait()
                     if _stats:
-                        _stats.record(command, session_id, False, time.time() - _t0)
+                        await asyncio.to_thread(_stats.record, command, session_id, False, time.time() - _t0)
                     yield MessagePart(
                         content=fmt("agent", "agent_timeout", "[error] agent exceeded max_duration ({timeout}s)",
                                     agent=command, timeout=max_duration) + "\n",
@@ -520,7 +529,7 @@ def make_pty_agent_handler(agent_cfg: dict, verbose: bool = False):
                     proc.kill()
                     await proc.wait()
                     if _stats:
-                        _stats.record(command, session_id, False, time.time() - _t0)
+                        await asyncio.to_thread(_stats.record, command, session_id, False, time.time() - _t0)
                     yield MessagePart(
                         content=fmt("agent", "agent_timeout", "[error] agent timeout (idle {timeout}s)",
                                     agent=command, timeout=idle_timeout) + "\n",
@@ -540,10 +549,10 @@ def make_pty_agent_handler(agent_cfg: dict, verbose: bool = False):
             proc.kill()
             await proc.wait()
             if _stats:
-                _stats.record(command, session_id, False, time.time() - _t0)
+                await asyncio.to_thread(_stats.record, command, session_id, False, time.time() - _t0)
             raise
         if _stats:
-            _stats.record(command, session_id, proc.returncode == 0, time.time() - _t0)
+            await asyncio.to_thread(_stats.record, command, session_id, proc.returncode == 0, time.time() - _t0)
         log.info("pty_done: cmd=%s session=%s exit=%s", command, session_id, proc.returncode)
 
     return handler
