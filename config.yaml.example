@@ -11,6 +11,7 @@ server:
 pool:
   max_processes: 20
   max_per_agent: 10
+  acquire_timeout: 60                           # seconds to wait for a free slot when pool is full; 0 = fail fast
 
 harness:
   binary: ""                                    # absolute path to harness-factory binary; empty = disabled

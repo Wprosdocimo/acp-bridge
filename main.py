@@ -183,6 +183,7 @@ def main():
     ) if acp_agents else None
     if pool:
         pool._memory_limit_pct = pool_cfg.get("memory_limit_percent", 80)
+        pool._acquire_timeout = pool_cfg.get("acquire_timeout", 60)
 
     # --- Register agent handlers ---
     server = Server()

@@ -472,7 +472,9 @@ class TestConcurrencyAndRaceConditions:
 
     @pytest.mark.asyncio
     async def test_pool_exhausted_raises_not_deadlocks(self, small_pool):
-        """池满且全 busy 时，新请求立即 PoolExhaustedError 而非挂起."""
+        """池满且全 busy 时（acquire_timeout=0 fail-fast 模式），新请求立即
+        PoolExhaustedError 而非挂起。默认模式的有界等待见 test_acp_pool.py."""
+        small_pool._acquire_timeout = 0
         for i in range(3):
             c = self._make_fake_conn("kiro", f"busy{i}", busy=True)
             small_pool._connections[("kiro", f"busy{i}")] = c

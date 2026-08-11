@@ -22,6 +22,7 @@ pool:
   max_processes: 8                              # max total ACP subprocesses
   max_per_agent: 4                              # max subprocesses per agent type
   memory_limit_percent: 80                      # OOM eviction threshold (system memory %)
+  acquire_timeout: 60                           # wait up to N seconds for a free slot when pool is full; 0 = fail fast (v0.40.0)
 
 webhook:
   url: "http://<openclaw-ip>:18789/tools/invoke"  # callback endpoint

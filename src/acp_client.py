@@ -381,6 +381,7 @@ class AcpProcessPool:
         self._verbose = verbose
         self._connections: dict[tuple[str, str], AcpConnection] = {}
         self._memory_limit_pct: float = 80.0
+        self._acquire_timeout: float = 60.0  # seconds to wait for a free slot; 0 = fail fast
         self._lock = asyncio.Lock()
         self._pids_dirty: bool = False
 
@@ -446,8 +447,23 @@ class AcpProcessPool:
         return conn
 
     async def get_or_create(self, agent: str, session_id: str, cwd: str = "", profile: dict | None = None, resume_session_id: str = "") -> AcpConnection:
-        async with self._lock:
-            return await self._get_or_create_unlocked(agent, session_id, cwd, profile, resume_session_id)
+        # Bounded wait: when the pool is full, poll for a freed slot instead of
+        # failing immediately. The wait loop sits OUTSIDE self._lock so other
+        # agents' acquisitions proceed while we wait.
+        deadline = time.monotonic() + self._acquire_timeout
+        waited = False
+        while True:
+            try:
+                async with self._lock:
+                    return await self._get_or_create_unlocked(agent, session_id, cwd, profile, resume_session_id)
+            except PoolExhaustedError:
+                if self._acquire_timeout <= 0 or time.monotonic() + 2.0 > deadline:
+                    raise
+                if not waited:
+                    waited = True
+                    log.info("pool_full_waiting: agent=%s session=%s timeout=%.0fs",
+                             agent, session_id, self._acquire_timeout)
+                await asyncio.sleep(2.0)
 
     async def _get_or_create_unlocked(self, agent: str, session_id: str, cwd: str = "", profile: dict | None = None, resume_session_id: str = "") -> AcpConnection:
         key = (agent, session_id)
