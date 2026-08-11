@@ -12,12 +12,12 @@ from pathlib import Path
 
 from .acp_client import AcpError, AcpProcessPool, PoolExhaustedError
 from .fallback_policy import get_best_fallback
-from .formatters import PipelineFormatter, get_template, get_prompt_suffix
+from .formatters import PipelineFormatter, get_payload_builder, get_template, get_prompt_suffix
 from .prompt_log import PromptStore
 from .sse import transform_notification
 from .store import PipelineStore
 from .utils import run_pty_subprocess
-from .webhook import WebhookSender, chunk_text
+from .webhook import WebhookSender
 
 log = logging.getLogger("acp-bridge.pipeline")
 
@@ -301,6 +301,11 @@ class PipelineManager:
                      pl.pipeline_id, pl.mode, pl.retries, self.MAX_RECOVERY_RETRIES,
                      done, len(pl.steps))
             asyncio.create_task(self._run(pl))
+
+    def active_cwds(self) -> set[str]:
+        """shared_cwd of every not-yet-finished pipeline — workspace sweeper must skip these."""
+        return {pl.context.get("shared_cwd", "") for pl in self._pipelines.values()
+                if pl.completed_at == 0 and pl.context.get("shared_cwd")}
 
     def cleanup(self, max_age: float = 3600) -> int:
         """Remove completed pipelines older than max_age from in-memory cache."""
@@ -610,15 +615,9 @@ class PipelineManager:
         fmt = pl.webhook_meta.get("format", self._sender.default_format)
         secret = pl.webhook_meta.get("secret", self._sender._secret)
 
-        if fmt == "generic":
-            parts = chunk_text(message, self._CHUNK_SIZE)
-            payloads = [{"pipeline_id": pl.pipeline_id, "mode": pl.mode,
-                         "status": pl.status, "message": p,
-                         "part": i+1, "total_parts": len(parts)}
-                        for i, p in enumerate(parts)]
-        else:
-            payloads = [{"tool": "message", "action": "send",
-                         "args": {"channel": channel, "target": target, "message": message}}]
+        payloads = get_payload_builder(fmt).build_pipeline(
+            pl.pipeline_id, pl.mode, pl.status, message,
+            channel=channel, target=target, chunk_size=self._CHUNK_SIZE)
 
         await self._sender.send(
             url, payloads, secret=secret,
@@ -655,8 +654,10 @@ class PipelineManager:
         steps_data = [{"agent": s.agent, "status": s.status,
                        "started_at": s.started_at, "completed_at": s.completed_at}
                       for s in pl.steps]
+        from .render import publish_artifacts
         msg = PipelineFormatter.format_done(
-            pl.pipeline_id, pl.status, dur, error=pl.error, steps=steps_data)
+            pl.pipeline_id, pl.status, dur, error=pl.error, steps=steps_data,
+            artifacts=await publish_artifacts(pl.context, steps_data))
         await self._send_webhook(pl, msg)
 
     async def _run_sequence(self, pl: Pipeline):

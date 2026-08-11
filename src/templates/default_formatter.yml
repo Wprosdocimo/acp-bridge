@@ -15,6 +15,10 @@ pipeline:
   done_fail: "🔗 **Pipeline** `{id}` ❌ 失败，耗时 {dur}s\n{error}"
   detail_line: "> {icon} {idx}. {agent}: {dur}s"
   turn: "🔗 `{id}` 💬 Turn {turn}: {icon} **{agent}** ({dur}s)\n{preview}"
+  artifacts_header: "📦 **产物**"
+  artifact_link: "> 📎 [{label}]({url})"
+  artifact_local: "> 📎 {label}: `{path}`"
+  artifact_missing: "> ⚠️ {label}: 未生成 (`{pattern}`)"
 
 # ── Job ───────────────────────────────────────────
 job:

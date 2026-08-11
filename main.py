@@ -440,8 +440,10 @@ def main():
     from contextlib import asynccontextmanager
 
     busy_timeout = pool_cfg.get("busy_timeout", 360)
+    ws_ttl_hours = srv_cfg.get("workspace_ttl_hours", 72)
 
     async def cleanup_loop():
+        from src import workspace
         while True:
             await asyncio.sleep(60)
             if pool:
@@ -454,6 +456,10 @@ def main():
                 job_mgr.cleanup()
             if pipeline_mgr:
                 pipeline_mgr.cleanup()
+                if ws_ttl_hours > 0:
+                    await asyncio.to_thread(workspace.sweep, conv_workdir,
+                                            ws_ttl_hours * 3600,
+                                            pipeline_mgr.active_cwds())
             stats_collector.delete_old()
 
     heartbeat_interval = heartbeat_cfg.get("interval", 0)

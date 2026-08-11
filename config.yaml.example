@@ -6,6 +6,7 @@ server:
   ui: false                                     # enable Web UI at /ui (or use --ui flag)
   upload_dir: "/tmp/acp-uploads"                # file upload storage directory
   conversation_workdir: "/tmp/acp-conversations" # shared workspace for conversation mode
+  workspace_ttl_hours: 72                       # sweep expired pipeline-*/conv-* workspaces; 0 = never
 
 pool:
   max_processes: 20

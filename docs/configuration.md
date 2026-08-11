@@ -16,6 +16,7 @@ server:
   shutdown_timeout: 30                          # graceful shutdown wait (seconds)
   ui: false                                     # enable Web UI at /ui (or use --ui flag)
   upload_dir: "/tmp/acp-uploads"                # file upload storage directory
+  workspace_ttl_hours: 72                       # sweep expired pipeline-*/conv-* workspaces; 0 = never (v0.39.0)
 
 pool:
   max_processes: 8                              # max total ACP subprocesses
