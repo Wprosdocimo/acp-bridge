@@ -247,7 +247,15 @@ def main():
         log.info("s3: file sharing enabled")
 
     # --- App + middleware ---
-    app = create_app(*server.agents)
+    # SDK hotfixes (see src/acp_patch.py): per-key watch Events instead of the
+    # SDK's global one (thundering herd — every store write woke every run
+    # watcher), and cancellation-watcher reaping (zombie watchers accumulated
+    # per finished run). Root cause of the 2026-08-11 100%-CPU incident.
+    from datetime import timedelta
+    from src.acp_patch import PerKeyEventMemoryStore, apply_executor_patch
+    apply_executor_patch()
+    app = create_app(*server.agents,
+                     store=PerKeyEventMemoryStore(limit=1000, ttl=timedelta(hours=1)))
 
     # Extract the SDK's internal agents dict for dynamic registration
     for route in app.routes:
