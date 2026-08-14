@@ -673,8 +673,31 @@ class PipelineManager:
             artifacts=await publish_artifacts(pl.context, steps_data))
         await self._send_webhook(pl, msg)
 
+    def _check_step_artifact(self, pl: Pipeline, idx: int) -> str:
+        """Verify the step's declared `type: file` artifact exists in shared_cwd.
+
+        Artifact declarations are the pipeline's deliverable contract: if a step
+        declared it produces gdd.md and the file is not on disk, every downstream
+        step will run against stale or missing inputs. Returns an error message
+        when the deliverable is missing, "" otherwise. url/other types are not
+        checked (patterns may be prefixes with nothing to verify locally).
+        """
+        arts = pl.context.get("_artifacts") or []
+        art = arts[idx] if idx < len(arts) else None
+        if not art or art.get("type") != "file":
+            return ""
+        pattern = art.get("pattern", "")
+        cwd = pl.context.get("shared_cwd", "")
+        if not pattern or not cwd:
+            return ""
+        if any(p.is_file() and p.stat().st_size > 0 for p in Path(cwd).glob(pattern)):
+            return ""
+        label = art.get("label") or pattern
+        return (f"deliverable missing: declared artifact '{label}' ({pattern}) "
+                f"not found (or empty) in {cwd} after step completed")
+
     async def _run_sequence(self, pl: Pipeline):
-        for step in pl.steps:
+        for i, step in enumerate(pl.steps):
             # Recovery resume: steps already completed before a restart keep
             # their persisted results and are not re-executed.
             if step.status == "completed":
@@ -683,6 +706,15 @@ class PipelineManager:
                 continue
             prompt = self._render(step.prompt_template, pl.context)
             await self._exec_step(pl, step, prompt)
+            # Fail fast when a declared file deliverable was not produced —
+            # downstream steps would otherwise run against stale/missing inputs.
+            if step.status == "completed":
+                missing = self._check_step_artifact(pl, i)
+                if missing:
+                    step.status = "failed"
+                    step.error = missing
+                    log.warning("artifact_check_failed: pipeline=%s step=%d agent=%s %s",
+                                pl.pipeline_id, i, step.agent, missing)
             await self._webhook_step(pl, step)
             if step.status == "failed":
                 pl.status = "failed"
