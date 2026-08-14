@@ -107,7 +107,8 @@ class PipelineFormatter:
 
     @staticmethod
     def format_done(pipeline_id: str, status: str, dur: float,
-                    error: str = "", steps: list | None = None) -> str:
+                    error: str = "", steps: list | None = None,
+                    artifacts: list | None = None) -> str:
         if status == "failed":
             header = fmt("pipeline", "done_fail",
                          "🔗 **Pipeline** `{id}` ❌ 失败，耗时 {dur}s\n{error}",
@@ -127,7 +128,31 @@ class PipelineFormatter:
                                        icon=icon, idx=i, agent=s["agent"], dur=sd))
             if details:
                 header += "\n" + "\n".join(details)
+        if artifacts:
+            header += "\n" + PipelineFormatter.format_artifacts(artifacts)
         return header
+
+    @staticmethod
+    def format_artifacts(artifacts: list) -> str:
+        """Render the artifact block for the done message.
+
+        Per entry: presigned url > local path > missing warning. Non-file
+        types (url/...) always show their rendered pattern as a link.
+        """
+        lines = [fmt("pipeline", "artifacts_header", "📦 **产物**")]
+        for a in artifacts:
+            label = a.get("label") or a.get("pattern", "")
+            if a.get("url"):
+                lines.append(fmt("pipeline", "artifact_link",
+                                 "> 📎 [{label}]({url})", label=label, url=a["url"]))
+            elif a.get("path"):
+                lines.append(fmt("pipeline", "artifact_local",
+                                 "> 📎 {label}: `{path}`", label=label, path=a["path"]))
+            else:
+                lines.append(fmt("pipeline", "artifact_missing",
+                                 "> ⚠️ {label}: 未生成 (`{pattern}`)",
+                                 label=label, pattern=a.get("pattern", "")))
+        return "\n".join(lines)
 
     @staticmethod
     def format_turn(pipeline_id: str, turn: int, agent: str,
@@ -137,6 +162,56 @@ class PipelineFormatter:
                    "🔗 `{id}` 💬 Turn {turn}: {icon} **{agent}** ({dur}s)\n{preview}",
                    id=pipeline_id[:8], turn=turn, icon=icon,
                    agent=agent, dur=dur, preview=_preview(content))
+
+
+# ── Pipeline Payload Builders ────────────────────────────
+#
+# Same pluggable pattern as the job-side get_formatter(channel) registry, but
+# keyed by webhook *format* (payload wire shape), not IM channel: openclaw is
+# the RPC envelope OpenClaw expects, generic is plain JSON for Hermes and any
+# HTTP endpoint. New downstreams register here; pipeline.py stays untouched.
+
+
+class PayloadBuilder:
+    """Build webhook payload list from a formatted pipeline message."""
+
+    def build_pipeline(self, pipeline_id: str, mode: str, status: str,
+                       message: str, *, channel: str = "discord",
+                       target: str = "", chunk_size: int = 1800) -> list[dict]:
+        raise NotImplementedError
+
+
+class OpenclawPayloadBuilder(PayloadBuilder):
+    """OpenClaw RPC envelope — single message, no chunking (OpenClaw splits)."""
+
+    def build_pipeline(self, pipeline_id, mode, status, message, *,
+                       channel="discord", target="", chunk_size=1800):
+        return [{"tool": "message", "action": "send",
+                 "args": {"channel": channel, "target": target, "message": message}}]
+
+
+class GenericPayloadBuilder(PayloadBuilder):
+    """Plain JSON for Hermes / arbitrary HTTP endpoints, chunked."""
+
+    def build_pipeline(self, pipeline_id, mode, status, message, *,
+                       channel="discord", target="", chunk_size=1800):
+        from .webhook import chunk_text
+        parts = chunk_text(message, chunk_size)
+        return [{"pipeline_id": pipeline_id, "mode": mode, "status": status,
+                 "message": p, "part": i + 1, "total_parts": len(parts)}
+                for i, p in enumerate(parts)]
+
+
+_PAYLOAD_BUILDERS: dict[str, PayloadBuilder] = {
+    "openclaw": OpenclawPayloadBuilder(),
+    "generic": GenericPayloadBuilder(),
+}
+
+
+def get_payload_builder(fmt_name: str) -> PayloadBuilder:
+    """Route by webhook format; unknown formats fall back to openclaw
+    (matches the pre-v0.39 else-branch behavior in pipeline._send_webhook)."""
+    return _PAYLOAD_BUILDERS.get(fmt_name, _PAYLOAD_BUILDERS["openclaw"])
 
 
 # ── Job Formatters ───────────────────────────────────────

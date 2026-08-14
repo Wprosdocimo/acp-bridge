@@ -28,6 +28,7 @@ CREATE TABLE IF NOT EXISTS jobs (
 );
 CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);
 CREATE INDEX IF NOT EXISTS idx_jobs_created ON jobs(created_at);
+CREATE INDEX IF NOT EXISTS idx_jobs_completed ON jobs(completed_at);
 """
 
 
@@ -36,6 +37,7 @@ class JobStore:
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
         self._db = sqlite3.connect(db_path, check_same_thread=False)
         self._db.execute("PRAGMA journal_mode=WAL")
+        self._db.execute("PRAGMA busy_timeout=5000")
         self._db.row_factory = sqlite3.Row
         self._db.executescript(_SCHEMA)
         self._migrate()
@@ -153,6 +155,7 @@ class ChatStore:
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
         self._db = sqlite3.connect(db_path, check_same_thread=False)
         self._db.execute("PRAGMA journal_mode=WAL")
+        self._db.execute("PRAGMA busy_timeout=5000")
         self._db.row_factory = sqlite3.Row
         self._db.executescript(_CHAT_SCHEMA)
 
@@ -211,6 +214,7 @@ CREATE TABLE IF NOT EXISTS pipelines (
     completed_at REAL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_pipelines_created ON pipelines(created_at);
+CREATE INDEX IF NOT EXISTS idx_pipelines_completed ON pipelines(completed_at);
 
 CREATE TABLE IF NOT EXISTS pipeline_events (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -239,6 +243,7 @@ class PipelineStore:
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
         self._db = sqlite3.connect(db_path, check_same_thread=False)
         self._db.execute("PRAGMA journal_mode=WAL")
+        self._db.execute("PRAGMA busy_timeout=5000")
         self._db.row_factory = sqlite3.Row
         self._db.executescript(_PIPELINE_SCHEMA)
         self._migrate()
@@ -305,6 +310,11 @@ class PipelineStore:
         cutoff = time.time() - max_age
         self._db.execute(
             """DELETE FROM pipeline_events WHERE pipeline_id IN
+               (SELECT pipeline_id FROM pipelines WHERE completed_at > 0 AND completed_at < ?)""",
+            (cutoff,),
+        )
+        self._db.execute(
+            """DELETE FROM conversation_log WHERE pipeline_id IN
                (SELECT pipeline_id FROM pipelines WHERE completed_at > 0 AND completed_at < ?)""",
             (cutoff,),
         )

@@ -9,7 +9,8 @@ from starlette.staticfiles import StaticFiles
 from ..store import ChatStore
 
 
-def register(app, config: dict):
+def register(app, config: dict) -> ChatStore:
+    """Register chat routes. Returns the ChatStore so main's cleanup loop can prune it."""
     db_path = config.get("server", {}).get("db_path", "data/jobs.db")
     chat_store = ChatStore(db_path)
 
@@ -27,7 +28,7 @@ def register(app, config: dict):
 
     static_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "static")
     if not os.path.isdir(static_dir):
-        return
+        return chat_store
 
     app.mount("/static", StaticFiles(directory=static_dir), name="static")
 
@@ -60,3 +61,5 @@ def register(app, config: dict):
     async def clear_chat_messages():
         n = chat_store.clear_all()
         return {"deleted": n}
+
+    return chat_store

@@ -17,6 +17,12 @@ Bridge supports two webhook formats because the downstream receivers speak diffe
 
 **Why not unify?** OpenClaw expects its own RPC envelope (`tool` + `action` + `args`). Generic receivers (Hermes, custom webhooks) expect plain JSON with the message in a `message` field. Sending RPC format to a generic receiver works at the HTTP level (202 Accepted) but the receiver treats the entire JSON structure as raw text instead of extracting the message — the result is garbled output in your IM channel.
 
+**Pluggable builders (v0.39.0):** pipeline payload assembly is a registry in
+`src/formatters.py` — `get_payload_builder(format)` returns an
+`OpenclawPayloadBuilder` or `GenericPayloadBuilder` (unknown formats fall back
+to openclaw). Adding a new downstream format means registering one class in
+`_PAYLOAD_BUILDERS`; `src/pipeline.py` needs no changes.
+
 ## Configuration
 
 ### OpenClaw

@@ -183,6 +183,7 @@ def main():
     ) if acp_agents else None
     if pool:
         pool._memory_limit_pct = pool_cfg.get("memory_limit_percent", 80)
+        pool._acquire_timeout = pool_cfg.get("acquire_timeout", 60)
 
     # --- Register agent handlers ---
     server = Server()
@@ -246,7 +247,15 @@ def main():
         log.info("s3: file sharing enabled")
 
     # --- App + middleware ---
-    app = create_app(*server.agents)
+    # SDK hotfixes (see src/acp_patch.py): per-key watch Events instead of the
+    # SDK's global one (thundering herd — every store write woke every run
+    # watcher), and cancellation-watcher reaping (zombie watchers accumulated
+    # per finished run). Root cause of the 2026-08-11 100%-CPU incident.
+    from datetime import timedelta
+    from src.acp_patch import PerKeyEventMemoryStore, apply_executor_patch
+    apply_executor_patch()
+    app = create_app(*server.agents,
+                     store=PerKeyEventMemoryStore(limit=1000, ttl=timedelta(hours=1)))
 
     # Extract the SDK's internal agents dict for dynamic registration
     for route in app.routes:
@@ -433,15 +442,26 @@ def main():
         if env_collector:
             env_collector._acp_agents_provider = lambda: getattr(app.state, "acp_agents", {})
 
+    chat_store = None
     if ui_enabled:
-        chat_routes.register(app, config)
+        chat_store = chat_routes.register(app, config)
 
     # --- Lifespan ---
     from contextlib import asynccontextmanager
 
     busy_timeout = pool_cfg.get("busy_timeout", 360)
+    ws_ttl_hours = srv_cfg.get("workspace_ttl_hours", 72)
+
+    # Data retention (v0.41.0) — these tables previously grew unbounded.
+    # prompt_log honors its pre-existing (but never wired) retention_days key.
+    retention_cfg = config.get("retention", {})
+    pipeline_retention = retention_cfg.get("pipelines_days", 7) * 86400
+    chat_retention = retention_cfg.get("chat_days", 7) * 86400
+    prompt_retention = pl_cfg.get("retention_days", 30) * 86400
+    usage_retention = retention_cfg.get("llm_usage_days", 30) * 86400
 
     async def cleanup_loop():
+        from src import workspace
         while True:
             await asyncio.sleep(60)
             if pool:
@@ -454,7 +474,17 @@ def main():
                 job_mgr.cleanup()
             if pipeline_mgr:
                 pipeline_mgr.cleanup()
-            stats_collector.delete_old()
+                await asyncio.to_thread(pipeline_mgr._store.delete_old, pipeline_retention)
+                if ws_ttl_hours > 0:
+                    await asyncio.to_thread(workspace.sweep, conv_workdir,
+                                            ws_ttl_hours * 3600,
+                                            pipeline_mgr.active_cwds())
+            await asyncio.to_thread(stats_collector.delete_old)
+            if prompt_store:
+                await asyncio.to_thread(prompt_store.cleanup_older_than, prompt_retention)
+            if chat_store:
+                await asyncio.to_thread(chat_store.delete_old, chat_retention)
+            await asyncio.to_thread(litellm_routes.delete_old, usage_retention)
 
     heartbeat_interval = heartbeat_cfg.get("interval", 0)
     if env_collector:
@@ -482,7 +512,8 @@ def main():
             async for notification in conn.session_prompt(prompt, idle_timeout=HEARTBEAT_IDLE_TIMEOUT):
                 if "_prompt_result" in notification:
                     from src.agents import _record_acp_usage
-                    _record_acp_usage(agent_name, notification["_prompt_result"], time.time() - t0)
+                    await asyncio.to_thread(
+                        _record_acp_usage, agent_name, notification["_prompt_result"], time.time() - t0)
                     break
                 event = transform_notification(notification)
                 if event and event["type"] == "message.part":

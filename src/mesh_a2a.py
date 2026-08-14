@@ -129,22 +129,29 @@ class A2AAdapter:
             )
         except UnsafeUrlError as e:
             return _rpc_error(rpc_id, -32014, f"unsafe workspace url: {e}")
+        import asyncio
         import tempfile, uuid
         import httpx
         from src import s3 as _s3
         from src.agents import _call_acp_agent_internal
         prompt = "".join(p.get("text", "") for p in (params.get("message") or {}).get("parts", []))
         tmp = tempfile.mkdtemp(prefix="mesh-ws-")
-        try:
-            # httpx's module-level get/put accept no `extensions`, so pinning
-            # requires a real Client. follow_redirects stays off so a 30x can't
-            # escape the validated IP — see url_safety.py.
+
+        # httpx's module-level get/put accept no `extensions`, so pinning
+        # requires a real Client. follow_redirects stays off so a 30x can't
+        # escape the validated IP — see url_safety.py. The transfers and the
+        # tar (un)pack run in a thread: a slow peer or big workspace must not
+        # stall the event loop (up to timeout=120s).
+        def _download():
             with httpx.Client(timeout=120, follow_redirects=False) as c:
                 r = c.get(ws_in_target.pinned_url,
                           headers={"Host": ws_in_target.host_header},
                           extensions={"sni_hostname": ws_in_target.host})
             r.raise_for_status()
             _s3.unpack_dir(r.content, tmp)
+
+        try:
+            await asyncio.to_thread(_download)
         except Exception as e:
             return _rpc_error(rpc_id, -32012, f"workspace download failed: {e}")
         session_id = str(uuid.uuid4())
@@ -159,11 +166,13 @@ class A2AAdapter:
             log.warning("a2a workspace step failed skill=%s err=%s", skill, e)
             return _rpc_error(rpc_id, -32000, f"agent error: {e}")
         if ws_out_target:
-            try:
+            def _upload():
                 with httpx.Client(timeout=120, follow_redirects=False) as c:
                     c.put(ws_out_target.pinned_url, content=_s3.pack_dir(tmp),
                           headers={"Host": ws_out_target.host_header},
                           extensions={"sni_hostname": ws_out_target.host}).raise_for_status()
+            try:
+                await asyncio.to_thread(_upload)
             except Exception as e:
                 return _rpc_error(rpc_id, -32013, f"workspace upload failed: {e}")
         return _rpc_result(rpc_id, {

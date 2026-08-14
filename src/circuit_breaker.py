@@ -62,6 +62,24 @@ class CircuitBreaker:
 
     async def call(self, func: Callable, *args: Any, **kwargs: Any) -> Any:
         """Execute *func* through the breaker. Raises CircuitBreakerOpenError if OPEN."""
+        await self.before_call()
+        try:
+            result = await func(*args, **kwargs)
+            await self.on_success()
+            return result
+        except self.config.excluded_exceptions:
+            raise  # bypass breaker entirely (e.g. rate-limit)
+        except self.config.expected_exceptions:
+            await self.on_failure()
+            raise
+
+    async def before_call(self) -> None:
+        """Admission gate — raises CircuitBreakerOpenError if the breaker rejects.
+
+        For callers that can't hand the breaker a plain awaitable (e.g. async
+        generators streaming parts): gate with before_call(), then report the
+        outcome via on_success()/on_failure().
+        """
         async with self._lock:
             self._maybe_transition_to_half_open()
             if self.state == CircuitState.OPEN:
@@ -72,15 +90,13 @@ class CircuitBreaker:
                         f"circuit breaker '{self.name}' half-open call limit reached")
                 self._half_open_calls += 1
 
-        try:
-            result = await func(*args, **kwargs)
-            await self._on_success()
-            return result
-        except self.config.excluded_exceptions:
-            raise  # bypass breaker entirely (e.g. rate-limit)
-        except self.config.expected_exceptions as e:
-            await self._on_failure()
-            raise
+    async def on_success(self) -> None:
+        async with self._lock:
+            self.record_success()
+
+    async def on_failure(self) -> None:
+        async with self._lock:
+            self.record_failure()
 
     def record_success(self) -> None:
         """Manual success recording (non-async path)."""
@@ -127,14 +143,6 @@ class CircuitBreaker:
     # ------------------------------------------------------------------
     # Internal
     # ------------------------------------------------------------------
-
-    async def _on_success(self) -> None:
-        async with self._lock:
-            self.record_success()
-
-    async def _on_failure(self) -> None:
-        async with self._lock:
-            self.record_failure()
 
     def _should_open(self) -> bool:
         # Trigger 1: consecutive failures

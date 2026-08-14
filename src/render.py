@@ -145,6 +145,38 @@ def resolve_artifacts(artifacts: list, steps: list, shared_cwd: str = "") -> lis
     return out
 
 
+async def publish_artifacts(context: dict, steps: list) -> list:
+    """Resolve declared artifacts and publish files to S3 for webhook delivery.
+
+    Returns resolve_artifacts() entries enriched with a presigned `url` for
+    `type: file` artifacts that exist on disk. S3 upload runs in a thread
+    (boto3 is blocking) and degrades silently: on failure the entry keeps its
+    local `path` and the formatter falls back to showing that. Never raises —
+    a webhook must go out even if publication fails.
+    """
+    declared = context.get("_artifacts")
+    if not declared:
+        return []
+    resolved = resolve_artifacts(declared, steps, context.get("shared_cwd", ""))
+    from src import s3
+    if not s3.is_available():
+        return resolved
+    import asyncio
+    uid = context.get("_uid", "")
+    for entry in resolved:
+        if entry.get("type") != "file" or not entry.get("exists"):
+            continue
+        name = Path(entry["path"]).name
+        key = f"artifacts/{uid or 'pl'}/{name}"
+        try:
+            url = await asyncio.to_thread(s3.upload, entry["path"], key)
+            if url:
+                entry["url"] = url
+        except Exception:
+            pass
+    return resolved
+
+
 def format_missing(missing: list) -> str:
     """One-line, de-duplicated summary of unresolved variables for a 400 body."""
     seen, out = set(), []

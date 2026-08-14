@@ -188,6 +188,30 @@ GET /pipelines/{id}/artifacts
 # Returns: {"shared_cwd": "...", "files": [{"path": "game.js", "size": 1234}, ...]}
 ```
 
+### Artifact delivery in webhooks (v0.39.0)
+
+When a pipeline with `steps[].artifact` declarations (v0.37.0) completes, the
+final webhook notification includes a `📦 产物` block — one line per declared
+artifact:
+
+- `type: file` + S3 configured → file uploaded, linked via presigned URL
+- `type: file` + no S3 → local path shown as fallback
+- pattern matched nothing → `⚠️ 未生成` warning
+- other types (e.g. `url`) → the rendered pattern linked as-is
+
+Upload runs off the event loop and degrades silently — notification delivery
+is never blocked by S3 failures. Line templates live in
+`src/templates/default_formatter.yml` under `pipeline.artifact_*`.
+
+### Workspace lifecycle (v0.39.0)
+
+Pipeline workspaces (`{public_workdir}/{mode}/pipeline-*`, `conversation/conv-*`)
+are swept after being idle longer than `server.workspace_ttl_hours` (default
+72, `0` disables). A workspace is only removed when **no file in its tree** is
+newer than the TTL cutoff, it is not owned by a running pipeline, and its
+directory name matches the `pipeline-`/`conv-` prefix — loose files users park
+at the top level of the workdir are never touched.
+
 ## Live Observability (v0.21.0)
 
 Three ways to follow a running pipeline in real time, choose by use case:

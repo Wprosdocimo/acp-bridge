@@ -30,7 +30,19 @@ When the pool is full and a new connection is needed:
 
 1. **Same-agent idle connection** → reuse process (reset session, skip respawn) — fastest
 2. **Any idle connection** → evict least-recently-used — reclaims a slot
-3. **All connections busy** → return `pool_exhausted` error
+3. **All connections busy** → bounded wait (see below), then `pool_exhausted` error
+
+## Bounded Wait (v0.40.0)
+
+When all connections are busy, `get_or_create()` no longer fails immediately.
+It polls for a freed slot every 2 seconds, up to `pool.acquire_timeout`
+seconds (default 60; `0` restores the old fail-fast behavior). The wait
+happens **outside** the pool lock, so acquisitions for other agents proceed
+normally while one caller waits. Each retry re-runs the full acquisition
+logic — LRU reuse, eviction, dead-process reaping — so any connection that
+turns idle is picked up on the next poll. Only after the timeout does the
+caller get `PoolExhaustedError` (which then feeds the existing fallback /
+pipeline-retry paths unchanged).
 
 ## OOM Protection
 

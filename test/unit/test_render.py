@@ -567,3 +567,75 @@ async def test_get_child_pipeline_resolves_inherited_artifacts():
     assert body["artifacts"][0]["label"] == "报告"
     assert body["artifacts"][0]["exists"] is True
     assert body["artifacts"][0]["path"].endswith(f"report-{uid}.md")
+
+
+# ============================================================================
+# publish_artifacts (v0.39.0) — S3 enrichment for webhook delivery
+# ============================================================================
+
+from src.render import publish_artifacts
+
+
+def _ws_with_artifact(tmpdir: str) -> dict:
+    with open(os.path.join(tmpdir, "gdd-ab12.md"), "w") as f:
+        f.write("# GDD")
+    return {
+        "shared_cwd": tmpdir,
+        "_uid": "ab12",
+        "_artifacts": [
+            {"type": "file", "label": "GDD", "pattern": "gdd-*.md"},
+            {"type": "file", "label": "Zip", "pattern": "nope-*.zip"},
+            {"type": "url", "label": "Site", "pattern": "https://cdn.example.com/x"},
+        ],
+    }
+
+
+STEPS3 = [{"agent": "harness"}, {"agent": "kiro"}, {"agent": "claude"}]
+
+
+@pytest.mark.asyncio
+async def test_publish_artifacts_uploads_existing_files(monkeypatch):
+    from src import s3
+    monkeypatch.setattr(s3, "is_available", lambda: True)
+    uploaded = {}
+
+    def fake_upload(path, key):
+        uploaded[key] = path
+        return f"https://s3.example/{key}?sig=1"
+
+    monkeypatch.setattr(s3, "upload", fake_upload)
+    with tempfile.TemporaryDirectory() as td:
+        out = await publish_artifacts(_ws_with_artifact(td), STEPS3)
+    assert out[0]["url"] == "https://s3.example/artifacts/ab12/gdd-ab12.md?sig=1"
+    assert list(uploaded) == ["artifacts/ab12/gdd-ab12.md"]
+    assert out[1]["exists"] is False and "url" not in out[1]   # missing: no upload
+    assert out[2]["url"].startswith("https://cdn.example.com") # url type passthrough
+
+
+@pytest.mark.asyncio
+async def test_publish_artifacts_degrades_without_s3(monkeypatch):
+    from src import s3
+    monkeypatch.setattr(s3, "is_available", lambda: False)
+    with tempfile.TemporaryDirectory() as td:
+        out = await publish_artifacts(_ws_with_artifact(td), STEPS3)
+    assert out[0]["exists"] is True and "url" not in out[0]
+    assert out[0]["path"].endswith("gdd-ab12.md")
+
+
+@pytest.mark.asyncio
+async def test_publish_artifacts_never_raises_on_upload_error(monkeypatch):
+    from src import s3
+    monkeypatch.setattr(s3, "is_available", lambda: True)
+
+    def boom(path, key):
+        raise RuntimeError("s3 down")
+
+    monkeypatch.setattr(s3, "upload", boom)
+    with tempfile.TemporaryDirectory() as td:
+        out = await publish_artifacts(_ws_with_artifact(td), STEPS3)
+    assert "url" not in out[0] and out[0]["path"]
+
+
+@pytest.mark.asyncio
+async def test_publish_artifacts_empty_when_no_declarations():
+    assert await publish_artifacts({"shared_cwd": "/tmp"}, []) == []

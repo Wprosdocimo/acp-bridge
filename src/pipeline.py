@@ -1,6 +1,7 @@
 """Multi-agent pipeline — sequence, parallel, race execution."""
 
 import asyncio
+import functools
 import json
 import logging
 import os
@@ -12,12 +13,12 @@ from pathlib import Path
 
 from .acp_client import AcpError, AcpProcessPool, PoolExhaustedError
 from .fallback_policy import get_best_fallback
-from .formatters import PipelineFormatter, get_template, get_prompt_suffix
+from .formatters import PipelineFormatter, get_payload_builder, get_template, get_prompt_suffix
 from .prompt_log import PromptStore
 from .sse import transform_notification
 from .store import PipelineStore
 from .utils import run_pty_subprocess
-from .webhook import WebhookSender, chunk_text
+from .webhook import WebhookSender
 
 log = logging.getLogger("acp-bridge.pipeline")
 
@@ -30,6 +31,7 @@ _VAR_RE = re.compile(r"\{\{(\w+)\}\}")
 _PROMPTS_DIR = Path(__file__).resolve().parent.parent / "prompts"
 
 
+@functools.lru_cache(maxsize=32)
 def _load_prompt(name: str) -> str:
     return (_PROMPTS_DIR / name).read_text().strip()
 
@@ -145,6 +147,16 @@ class PipelineManager:
         # L3: optional mesh hook. (agent) -> (peer_url, mesh_token) if the agent is a
         # remote skill that should run on a peer with S3 workspace relay, else None.
         self._mesh_resolver = None
+        # Strong refs to background tasks — asyncio only keeps weak refs, so an
+        # untracked create_task can be garbage-collected mid-flight.
+        self._tasks: set[asyncio.Task] = set()
+
+    def _spawn(self, coro):
+        task = asyncio.create_task(coro)
+        if task is not None:  # tests stub create_task to swallow the coro
+            self._tasks.add(task)
+            task.add_done_callback(self._tasks.discard)
+        return task
 
     def _make_shared_cwd(self, pl: Pipeline) -> str:
         """Create and return a shared workspace directory for the pipeline.
@@ -179,7 +191,7 @@ class PipelineManager:
         )
         self._pipelines[pl.pipeline_id] = pl
         self._store.save(pl)
-        asyncio.create_task(self._run(pl))
+        self._spawn(self._run(pl))
         log.info("pipeline_submitted: id=%s mode=%s steps=%d", pl.pipeline_id, mode, len(pl.steps))
         return pl
 
@@ -251,7 +263,7 @@ class PipelineManager:
                 pl.status = "failed"
                 pl.error = "interrupted: conversation pipelines are not resumable after restart"
                 pl.completed_at = time.time()
-                self._store.save(pl)
+                await asyncio.to_thread(self._store.save, pl)
                 self._emit_event(pl, "pipeline_done", {
                     "pipeline_id": pl.pipeline_id,
                     "status": pl.status,
@@ -267,7 +279,7 @@ class PipelineManager:
                 pl.status = "failed"
                 pl.error = f"interrupted: failed after {self.MAX_RECOVERY_RETRIES} recovery retries across restarts"
                 pl.completed_at = time.time()
-                self._store.save(pl)
+                await asyncio.to_thread(self._store.save, pl)
                 self._emit_event(pl, "pipeline_done", {
                     "pipeline_id": pl.pipeline_id,
                     "status": pl.status,
@@ -296,11 +308,16 @@ class PipelineManager:
             pl.error = ""
             pl.completed_at = 0
             self._pipelines[pl.pipeline_id] = pl
-            self._store.save(pl)
+            await asyncio.to_thread(self._store.save, pl)
             log.info("recovery_resume: pipeline=%s mode=%s attempt=%d/%d done_steps=%d/%d",
                      pl.pipeline_id, pl.mode, pl.retries, self.MAX_RECOVERY_RETRIES,
                      done, len(pl.steps))
-            asyncio.create_task(self._run(pl))
+            self._spawn(self._run(pl))
+
+    def active_cwds(self) -> set[str]:
+        """shared_cwd of every not-yet-finished pipeline — workspace sweeper must skip these."""
+        return {pl.context.get("shared_cwd", "") for pl in self._pipelines.values()
+                if pl.completed_at == 0 and pl.context.get("shared_cwd")}
 
     def cleanup(self, max_age: float = 3600) -> int:
         """Remove completed pipelines older than max_age from in-memory cache."""
@@ -402,8 +419,8 @@ class PipelineManager:
             pl.status = "completed" if not pl.error else "failed"
         # Upload final report to S3 if requested
         if pl.status == "completed" and pl.context.get("upload_report"):
-            self._upload_report(pl)
-        self._store.save(pl)
+            await asyncio.to_thread(self._upload_report, pl)
+        await asyncio.to_thread(self._store.save, pl)
         log.info("pipeline_done: id=%s status=%s duration=%.1fs",
                  pl.pipeline_id, pl.status, pl.completed_at - pl.created_at)
         self._emit_event(pl, "pipeline_done", {
@@ -474,7 +491,8 @@ class PipelineManager:
         inject = next_def.get("inject_upstream")
         if inject and steps:
             if inject == "s3":
-                self._inject_upstream_s3(pl, steps)
+                # S3 uploads inside are sync boto3 calls — keep off the loop
+                await asyncio.to_thread(self._inject_upstream_s3, pl, steps)
             else:
                 self._inject_upstream_text(pl, steps)
 
@@ -485,7 +503,7 @@ class PipelineManager:
             webhook_meta=pl.webhook_meta.copy(),
         )
         pl.context["next_pipeline_id"] = next_pl.pipeline_id
-        self._store.save(pl)
+        await asyncio.to_thread(self._store.save, pl)
         log.info("auto_chain: %s -> %s mode=%s steps=%d",
                  pl.pipeline_id, next_pl.pipeline_id, next_def["mode"], len(steps))
 
@@ -610,15 +628,9 @@ class PipelineManager:
         fmt = pl.webhook_meta.get("format", self._sender.default_format)
         secret = pl.webhook_meta.get("secret", self._sender._secret)
 
-        if fmt == "generic":
-            parts = chunk_text(message, self._CHUNK_SIZE)
-            payloads = [{"pipeline_id": pl.pipeline_id, "mode": pl.mode,
-                         "status": pl.status, "message": p,
-                         "part": i+1, "total_parts": len(parts)}
-                        for i, p in enumerate(parts)]
-        else:
-            payloads = [{"tool": "message", "action": "send",
-                         "args": {"channel": channel, "target": target, "message": message}}]
+        payloads = get_payload_builder(fmt).build_pipeline(
+            pl.pipeline_id, pl.mode, pl.status, message,
+            channel=channel, target=target, chunk_size=self._CHUNK_SIZE)
 
         await self._sender.send(
             url, payloads, secret=secret,
@@ -655,8 +667,10 @@ class PipelineManager:
         steps_data = [{"agent": s.agent, "status": s.status,
                        "started_at": s.started_at, "completed_at": s.completed_at}
                       for s in pl.steps]
+        from .render import publish_artifacts
         msg = PipelineFormatter.format_done(
-            pl.pipeline_id, pl.status, dur, error=pl.error, steps=steps_data)
+            pl.pipeline_id, pl.status, dur, error=pl.error, steps=steps_data,
+            artifacts=await publish_artifacts(pl.context, steps_data))
         await self._send_webhook(pl, msg)
 
     async def _run_sequence(self, pl: Pipeline):
@@ -789,7 +803,7 @@ class PipelineManager:
             # --- Human-in-the-loop: pause gate ---
             if not pl._gate.is_set():
                 pl.status = "paused"
-                self._store.save(pl)
+                await asyncio.to_thread(self._store.save, pl)
                 log.info("conv_paused: pipeline=%s turn=%d", pl.pipeline_id, turn)
                 await pl._gate.wait()
                 pl.status = "running"
@@ -811,7 +825,8 @@ class PipelineManager:
                 current_agent_label = "Human"
                 transcript.append({"turn": turn, "agent": current_agent_label,
                                    "content": output, "duration": duration})
-                self._store.save_turn(pl.pipeline_id, turn, current_agent_label, output, duration)
+                await asyncio.to_thread(
+                    self._store.save_turn, pl.pipeline_id, turn, current_agent_label, output, duration)
                 log.info("conv_inject: pipeline=%s turn=%d content=%s",
                          pl.pipeline_id, turn, output[:80])
                 await self._webhook_conversation_turn(pl, turn, current_agent_label, output, duration)
@@ -847,7 +862,8 @@ class PipelineManager:
             # Record
             transcript.append({"turn": turn, "agent": current_agent,
                                "content": output, "duration": duration})
-            self._store.save_turn(pl.pipeline_id, turn, current_agent, output, duration)
+            await asyncio.to_thread(
+                self._store.save_turn, pl.pipeline_id, turn, current_agent, output, duration)
             log.info("conv_turn: pipeline=%s turn=%d agent=%s duration=%.1fs",
                      pl.pipeline_id, turn, current_agent, duration)
 
@@ -903,7 +919,8 @@ class PipelineManager:
 
         ps = getattr(self, '_prompt_store', None)
         if ps and pl is not None:
-            ps.record(
+            await asyncio.to_thread(
+                ps.record,
                 parent_type="pipeline_step", parent_id=pl.pipeline_id,
                 parent_index=turn_idx, agent=agent,
                 mode=cfg.get("mode", "acp"), session_id=session_id, cwd=cwd,
@@ -1030,7 +1047,8 @@ class PipelineManager:
 
         ps = getattr(self, '_prompt_store', None)
         if ps:
-            ps.record(
+            await asyncio.to_thread(
+                ps.record,
                 parent_type="pipeline_step", parent_id=pl.pipeline_id,
                 parent_index=step_idx, agent=step.agent, mode=cfg.get("mode", "acp"),
                 session_id=session_id, cwd=shared_cwd,
@@ -1111,7 +1129,8 @@ class PipelineManager:
         first_error = step.error
 
         for attempt in range(self.MAX_STEP_FALLBACK):
-            next_agent = get_best_fallback(step.agent, tried, self._pool, None)
+            next_agent = await asyncio.to_thread(
+                get_best_fallback, step.agent, tried, self._pool, None)
             if next_agent is None:
                 break
             # Fallback agents must exist locally and be ACP mode
@@ -1243,7 +1262,11 @@ class PipelineManager:
         idx = pl.steps.index(step)
         base = f"mesh-ws/{pl.pipeline_id}/step-{idx}"
         try:
-            if not s3.put_bytes(f"{base}/in.tgz", s3.pack_dir(shared_cwd)):
+            # pack_dir tars the whole workspace (CPU) and put_bytes is sync
+            # boto3 — both run in a thread so they can't stall the loop.
+            uploaded = await asyncio.to_thread(
+                lambda: s3.put_bytes(f"{base}/in.tgz", s3.pack_dir(shared_cwd)))
+            if not uploaded:
                 step.status = "failed"; step.error = "workspace upload (A->S3) failed"; return
             in_url = s3.presigned_get(f"{base}/in.tgz")
             out_url = s3.presigned_put(f"{base}/out.tgz")
@@ -1262,9 +1285,12 @@ class PipelineManager:
                 step.status = "failed"; step.error = resp["error"].get("message", "remote error"); return
             # merge result workspace back into the authoritative shared_cwd
             get_out = s3.presigned_get(f"{base}/out.tgz")
-            ro = httpx.get(get_out, timeout=120)
-            if ro.status_code == 200 and ro.content:
-                s3.unpack_dir(ro.content, shared_cwd)
+
+            def _merge_back():
+                ro = httpx.get(get_out, timeout=120)
+                if ro.status_code == 200 and ro.content:
+                    s3.unpack_dir(ro.content, shared_cwd)
+            await asyncio.to_thread(_merge_back)
             arts = resp.get("result", {}).get("artifacts", [])
             step.result = "".join(p.get("text", "") for a in arts for p in a.get("parts", []))
             step.status = "completed"
@@ -1275,7 +1301,7 @@ class PipelineManager:
         finally:
             # Clean up ONLY this step's own prefix. Deleting the whole pipeline prefix
             # here would race parallel steps (first finisher wipes others' in/out.tgz).
-            s3.delete_prefix(f"{base}/")
+            await asyncio.to_thread(s3.delete_prefix, f"{base}/")
 
     async def _exec_step_pty(self, step: PipelineStep, prompt: str, cfg: dict):
         result = await run_pty_subprocess(

@@ -34,6 +34,7 @@ class AcpConnection:
     _reader_task: asyncio.Task | None = field(default=None, init=False)
     _stderr_task: asyncio.Task | None = field(default=None, init=False)
     _notification_queues: dict[int, asyncio.Queue] = field(default_factory=dict, init=False)
+    _fs_tasks: set = field(default_factory=set, init=False)
     acp_session_id: str | None = field(default=None, init=False)
     resolved_model: str | None = field(default=None, init=False)
     last_active: float = field(default_factory=time.time, init=False)
@@ -111,6 +112,38 @@ class AcpConnection:
         self.proc.stdin.write(data.encode())
         asyncio.ensure_future(self.proc.stdin.drain())
 
+    def _spawn_fs_reply(self, coro) -> None:
+        """Run an fs auto-reply without blocking the reader loop.
+
+        Keeps a strong ref so the task can't be GC'd mid-flight. JSON-RPC
+        replies are matched by id, so answering out of order is fine.
+        """
+        task = asyncio.ensure_future(coro)
+        self._fs_tasks.add(task)
+        task.add_done_callback(self._fs_tasks.discard)
+
+    async def _fs_read_reply(self, msg_id: int, path: str) -> None:
+        def _read():
+            with open(path) as f:
+                return f.read()
+        try:
+            content = await asyncio.to_thread(_read)
+            self._auto_reply(msg_id, {"content": content})
+        except Exception:
+            self._auto_reply(msg_id, {"content": f"ERROR: ENOENT: {path}"})
+
+    async def _fs_write_reply(self, msg_id: int, path: str, content: str) -> None:
+        def _write():
+            if os.path.dirname(path):
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w") as f:
+                f.write(content)
+        try:
+            await asyncio.to_thread(_write)
+            self._auto_reply(msg_id, {})
+        except Exception as e:
+            self._auto_reply_error(msg_id, -1, str(e))
+
     async def _drain_stderr(self) -> None:
         try:
             while True:
@@ -155,25 +188,15 @@ class AcpConnection:
                         option_id = self._pick_always_allow_option(msg.get("params", {}).get("options", []))
                         self._auto_reply(msg_id, {"outcome": {"outcome": "selected",
                                                               "optionId": option_id}})
-                    # Auto-reply fs requests (e.g. opengame ACP)
+                    # Auto-reply fs requests (e.g. opengame ACP) — file IO runs
+                    # in a thread so a large read/write can't stall the loop
                     elif msg.get("method") == "fs/read_text_file" and msg_id is not None:
                         path = msg.get("params", {}).get("path", "")
-                        try:
-                            content = open(path).read()
-                            self._auto_reply(msg_id, {"content": content})
-                        except Exception as e:
-                            self._auto_reply(msg_id, {"content": f"ERROR: ENOENT: {path}"})
+                        self._spawn_fs_reply(self._fs_read_reply(msg_id, path))
                     elif msg.get("method") == "fs/write_text_file" and msg_id is not None:
                         params = msg.get("params", {})
-                        path = params.get("path", "")
-                        content = params.get("content", "")
-                        try:
-                            os.makedirs(os.path.dirname(path), exist_ok=True) if os.path.dirname(path) else None
-                            with open(path, "w") as f:
-                                f.write(content)
-                            self._auto_reply(msg_id, {})
-                        except Exception as e:
-                            self._auto_reply_error(msg_id, -1, str(e))
+                        self._spawn_fs_reply(self._fs_write_reply(
+                            msg_id, params.get("path", ""), params.get("content", "")))
                     for q in self._notification_queues.values():
                         q.put_nowait(msg)
         except Exception as e:
@@ -401,6 +424,7 @@ class AcpProcessPool:
         self._verbose = verbose
         self._connections: dict[tuple[str, str], AcpConnection] = {}
         self._memory_limit_pct: float = 80.0
+        self._acquire_timeout: float = 60.0  # seconds to wait for a free slot; 0 = fail fast
         self._lock = asyncio.Lock()
         self._pids_dirty: bool = False
 
@@ -466,8 +490,23 @@ class AcpProcessPool:
         return conn
 
     async def get_or_create(self, agent: str, session_id: str, cwd: str = "", profile: dict | None = None, resume_session_id: str = "") -> AcpConnection:
-        async with self._lock:
-            return await self._get_or_create_unlocked(agent, session_id, cwd, profile, resume_session_id)
+        # Bounded wait: when the pool is full, poll for a freed slot instead of
+        # failing immediately. The wait loop sits OUTSIDE self._lock so other
+        # agents' acquisitions proceed while we wait.
+        deadline = time.monotonic() + self._acquire_timeout
+        waited = False
+        while True:
+            try:
+                async with self._lock:
+                    return await self._get_or_create_unlocked(agent, session_id, cwd, profile, resume_session_id)
+            except PoolExhaustedError:
+                if self._acquire_timeout <= 0 or time.monotonic() + 2.0 > deadline:
+                    raise
+                if not waited:
+                    waited = True
+                    log.info("pool_full_waiting: agent=%s session=%s timeout=%.0fs",
+                             agent, session_id, self._acquire_timeout)
+                await asyncio.sleep(2.0)
 
     async def _get_or_create_unlocked(self, agent: str, session_id: str, cwd: str = "", profile: dict | None = None, resume_session_id: str = "") -> AcpConnection:
         key = (agent, session_id)

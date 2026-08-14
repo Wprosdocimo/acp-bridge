@@ -76,8 +76,7 @@ def upload(local_path: str, key_name: str = "") -> Optional[str]:
     if not _available:
         return None
     try:
-        import boto3
-        s3 = boto3.client("s3", region_name=_region)
+        s3 = _client()
         if not key_name:
             key_name = os.path.basename(local_path)
         key = f"{_prefix}/{key_name}"
@@ -116,9 +115,17 @@ def upload_bytes(key_name: str, data: bytes) -> Optional[str]:
 
 # --- L3 mesh workspace relay helpers ---------------------------------------
 
+_client_cache = None
+
+
 def _client():
-    import boto3
-    return boto3.client("s3", region_name=_region)
+    # boto3 clients are thread-safe; construction costs ~3ms + first-call 70ms,
+    # so build once and reuse across all upload/presign/delete paths.
+    global _client_cache
+    if _client_cache is None:
+        import boto3
+        _client_cache = boto3.client("s3", region_name=_region)
+    return _client_cache
 
 
 def presigned_put(key_name: str, expires: int = 0) -> Optional[str]:
