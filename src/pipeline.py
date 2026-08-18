@@ -1,5 +1,6 @@
 """Multi-agent pipeline — sequence, parallel, race execution."""
 
+import ast
 import asyncio
 import functools
 import json
@@ -386,6 +387,9 @@ class PipelineManager:
 
     async def _run(self, pl: Pipeline):
         pl.status = "running"
+        # Seed the loop-round counter so {{_loop_round}} renders in step prompts
+        # (round 0 on first run; resubmits already carry the incremented value).
+        pl.context.setdefault("_loop_round", 0)
         try:
             shared_cwd = self._make_shared_cwd(pl)
             log.info("pipeline_cwd: id=%s mode=%s cwd=%s", pl.pipeline_id, pl.mode, shared_cwd)
@@ -438,9 +442,183 @@ class PipelineManager:
                 pass
         await self._webhook(pl)
 
-        # --- Auto-chain: if `next` is defined and pipeline succeeded, submit next ---
+        # --- Auto-chain / loop: if `next` is defined and pipeline succeeded ---
+        # A `next` carrying a `when` condition is a convergence loop (loop-until-
+        # converged); a plain `next` is the existing forward chain. Only completed
+        # pipelines advance — real failures (agent crash, missing deliverable,
+        # artifact fail-fast) took the `failed` path above and never loop.
         if pl.status == "completed" and pl.context.get("next"):
-            await self._auto_chain(pl)
+            next_def = pl.context["next"]
+            if isinstance(next_def, dict) and next_def.get("when"):
+                await self._maybe_loop(pl)
+            else:
+                await self._auto_chain(pl)
+
+    # --- Convergence loop (loop-until-converged) --------------------------------
+    # Node-level threshold + bounded retry back to an earlier step. A completed
+    # pipeline whose `next` carries a `when` expression reads a machine-readable
+    # verdict from shared_cwd, evaluates the threshold, and either converges
+    # (when False), re-submits the tail from `loop_back_to` (when True and rounds
+    # remain), or stops at max_rounds. See versions/v0.44.0.md.
+
+    # Only these AST node types may appear in a `when` expression. No Call, no
+    # Subscript, no comprehension, no import — so `when` can never execute code.
+    _COND_NODES = (
+        ast.Expression, ast.BoolOp, ast.And, ast.Or, ast.UnaryOp, ast.Not,
+        ast.Compare, ast.Lt, ast.LtE, ast.Gt, ast.GtE, ast.Eq, ast.NotEq,
+        ast.Attribute, ast.Name, ast.Load, ast.Constant,
+    )
+
+    @classmethod
+    def _check_cond_ast(cls, node):
+        if not isinstance(node, cls._COND_NODES):
+            raise ValueError(f"disallowed expression element: {type(node).__name__}")
+        if isinstance(node, ast.Attribute) and node.attr.startswith("__"):
+            raise ValueError(f"disallowed attribute: {node.attr}")
+        for child in ast.iter_child_nodes(node):
+            cls._check_cond_ast(child)
+
+    @classmethod
+    def _resolve_cond(cls, node, ns):
+        if isinstance(node, ast.Constant):
+            return node.value
+        if isinstance(node, ast.Name):
+            if node.id not in ns:
+                raise ValueError(f"unknown name in condition: {node.id}")
+            return ns[node.id]
+        if isinstance(node, ast.Attribute):
+            obj = cls._resolve_cond(node.value, ns)
+            if isinstance(obj, dict):
+                return obj.get(node.attr)
+            return getattr(obj, node.attr, None)
+        if isinstance(node, ast.UnaryOp):  # not
+            return not cls._resolve_cond(node.operand, ns)
+        if isinstance(node, ast.BoolOp):
+            vals = [cls._resolve_cond(v, ns) for v in node.values]
+            return all(vals) if isinstance(node.op, ast.And) else any(vals)
+        if isinstance(node, ast.Compare):
+            left = cls._resolve_cond(node.left, ns)
+            for op, comp in zip(node.ops, node.comparators):
+                right = cls._resolve_cond(comp, ns)
+                if left is None or right is None:
+                    return False  # missing metric -> comparison False (fail-safe)
+                ok = {
+                    ast.Lt: left < right, ast.LtE: left <= right,
+                    ast.Gt: left > right, ast.GtE: left >= right,
+                    ast.Eq: left == right, ast.NotEq: left != right,
+                }[type(op)]
+                if not ok:
+                    return False
+                left = right
+            return True
+        raise ValueError(f"cannot evaluate: {type(node).__name__}")
+
+    @classmethod
+    def _eval_condition(cls, expr: str, ns: dict) -> bool:
+        """Safely evaluate a `when` threshold expression against `ns`.
+
+        Uses an AST whitelist (comparisons, and/or/not, attribute access,
+        constants, whitelisted names) — never eval(). A missing metric makes its
+        comparison False, so an absent/partial verdict never spuriously loops.
+        """
+        tree = ast.parse(expr, mode="eval")
+        cls._check_cond_ast(tree)
+        return bool(cls._resolve_cond(tree.body, ns))
+
+    def _read_verdict(self, pl: Pipeline, source: str) -> dict | None:
+        """Load the machine-readable verdict from shared_cwd, namespaced by file
+        stem. `verdict.json` -> {"verdict": {...}} so `when` can reference
+        `verdict.overall`. Returns None if missing or unparseable (fail-safe:
+        caller stops the loop)."""
+        cwd = pl.context.get("shared_cwd", "")
+        if not cwd or not source:
+            return None
+        path = Path(cwd) / source
+        if not path.is_file():
+            return None
+        try:
+            data = json.loads(path.read_text())
+        except (OSError, ValueError) as e:
+            log.warning("verdict_parse_failed: pipeline=%s source=%s err=%s",
+                        pl.pipeline_id, source, e)
+            return None
+        stem = path.stem  # "verdict.json" -> "verdict"
+        return {stem: data, "round": pl.context.get("_loop_round", 0)}
+
+    async def _maybe_loop(self, pl: Pipeline):
+        """Evaluate the loop threshold and either converge, re-submit the tail
+        from `loop_back_to`, or stop at max_rounds."""
+        loop_def = pl.context["next"]
+        rnd = pl.context.get("_loop_round", 0)
+        max_rounds = int(loop_def.get("max_rounds", 3))
+        source = loop_def.get("when_source", "verdict.json")
+
+        ns = self._read_verdict(pl, source)
+        if ns is None:
+            # fail-safe: no verdict to judge -> stop, don't burn rounds
+            log.warning("loop_stop_no_verdict: pipeline=%s round=%d source=%s",
+                        pl.pipeline_id, rnd, source)
+            await self._loop_webhook(pl, rnd, "stopped: verdict 缺失，无法判定收敛")
+            return
+
+        try:
+            need_loop = self._eval_condition(loop_def["when"], ns)
+        except ValueError as e:
+            log.warning("loop_stop_bad_condition: pipeline=%s err=%s", pl.pipeline_id, e)
+            await self._loop_webhook(pl, rnd, f"stopped: 条件无法求值 ({e})")
+            return
+
+        if not need_loop:
+            log.info("loop_converged: pipeline=%s round=%d", pl.pipeline_id, rnd)
+            await self._loop_webhook(pl, rnd, f"converged: 第 {rnd + 1} 轮通过")
+            return
+
+        if rnd + 1 >= max_rounds:
+            log.info("loop_max_rounds: pipeline=%s rounds=%d", pl.pipeline_id, max_rounds)
+            await self._loop_webhook(
+                pl, rnd, f"stopped: 达到 max_rounds={max_rounds}，仍未通过")
+            return
+
+        # Re-submit the tail from loop_back_to, reusing shared_cwd; round += 1.
+        back_to = int(loop_def.get("loop_back_to", 0))
+        if back_to < 0 or back_to >= len(pl.steps):
+            log.warning("loop_bad_back_to: pipeline=%s loop_back_to=%d steps=%d",
+                        pl.pipeline_id, back_to, len(pl.steps))
+            await self._loop_webhook(pl, rnd, f"stopped: loop_back_to={back_to} 越界")
+            return
+
+        steps = [{"agent": s.agent, "prompt": s.prompt_template,
+                  "output_as": s.output_as, "timeout": s.timeout}
+                 for s in pl.steps[back_to:]]
+        next_context = dict(pl.context)
+        next_context["_loop_round"] = rnd + 1
+        next_context.pop("next_pipeline_id", None)
+        # The child pipeline IS the tail (steps[back_to:]), so its own loop-back
+        # target is index 0 — every further round re-runs the whole tail rather
+        # than a shrinking suffix. Copy the next-def so we don't mutate the
+        # parent's shared context dict.
+        next_context["next"] = {**loop_def, "loop_back_to": 0}
+        # _artifacts is positionally aligned with steps and indexed by step index
+        # in _check_step_artifact — slice it to match the re-submitted tail.
+        arts = pl.context.get("_artifacts")
+        if isinstance(arts, list):
+            next_context["_artifacts"] = arts[back_to:]
+
+        log.info("loop_back: pipeline=%s round=%d->%d back_to=%d tail_steps=%d",
+                 pl.pipeline_id, rnd, rnd + 1, back_to, len(steps))
+        next_pl = self.submit(
+            mode="sequence", steps=steps, context=next_context,
+            webhook_meta=pl.webhook_meta.copy(),
+        )
+        pl.context["next_pipeline_id"] = next_pl.pipeline_id
+        await asyncio.to_thread(self._store.save, pl)
+
+    async def _loop_webhook(self, pl: Pipeline, rnd: int, verdict: str):
+        """Push a one-line loop outcome, tagged with the round number."""
+        if not self._sender.default_url or not pl.webhook_meta.get("target"):
+            return
+        msg = f"🔁 pipeline {pl.pipeline_id[:8]} loop round {rnd + 1}: {verdict}"
+        await self._send_webhook(pl, msg)
 
     async def _auto_chain(self, pl: Pipeline):
         """Auto-submit the next pipeline, inheriting shared_cwd and output."""

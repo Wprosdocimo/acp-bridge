@@ -17,6 +17,12 @@ from pathlib import Path
 
 _VAR_RE = re.compile(r"\{\{(\w+)\}\}")
 
+# Placeholders resolved at pipeline runtime, not template-submit time. A loop
+# fix-step prompt may reference {{_loop_round}} ("read last round's report");
+# template rendering must leave these verbatim instead of reporting them missing
+# (which would 400 the submit). src/pipeline.py fills them each round from context.
+_RUNTIME_VARS = frozenset({"_loop_round"})
+
 
 def _render(obj, scope: dict, missing: list, path: str):
     """Recursively substitute `{{var}}` in every string reachable from obj.
@@ -29,6 +35,8 @@ def _render(obj, scope: dict, missing: list, path: str):
             name = m.group(1)
             if name in scope:
                 return str(scope[name])
+            if name in _RUNTIME_VARS:
+                return m.group(0)  # resolved later, per round, by the pipeline
             missing.append((name, path))
             return m.group(0)
         return _VAR_RE.sub(sub, obj)
