@@ -148,6 +148,8 @@ class PipelineManager:
         # L3: optional mesh hook. (agent) -> (peer_url, mesh_token) if the agent is a
         # remote skill that should run on a peer with S3 workspace relay, else None.
         self._mesh_resolver = None
+        # Lambda pool: optional serverless burst backend for steps with pool="lambda"
+        self._lambda_pool = None
         # Strong refs to background tasks — asyncio only keeps weak refs, so an
         # untracked create_task can be garbage-collected mid-flight.
         self._tasks: set[asyncio.Task] = set()
@@ -1275,6 +1277,10 @@ class PipelineManager:
                 await asyncio.wait_for(
                     self._exec_step_remote(pl, step, final_prompt, shared_cwd, mesh_target),
                     timeout=timeout)
+            elif cfg.get("pool") == "lambda" and self._lambda_pool:
+                await asyncio.wait_for(
+                    self._exec_step_lambda(pl, step, step_idx, final_prompt, cfg),
+                    timeout=timeout)
             elif cfg.get("mode") == "pty":
                 pty_cfg = {**cfg, "working_dir": shared_cwd} if shared_cwd else cfg
                 await asyncio.wait_for(
@@ -1293,10 +1299,13 @@ class PipelineManager:
 
         # --- Per-step fallback (local ACP steps only) ---
         # Timeouts deliberately excluded: another agent would burn the same
-        # wall-clock budget again. Mesh/PTY excluded: different exec paths.
+        # wall-clock budget again. Mesh/PTY/Lambda excluded: different exec paths.
+        # Lambda needs an explicit check — its config carries no "mode" key, so
+        # cfg.get("mode", "acp") would read as a local ACP agent.
         # Opt-out via context.step_fallback=false.
         if (step.status == "failed" and not timed_out
                 and not mesh_target and cfg.get("mode", "acp") == "acp"
+                and cfg.get("pool") != "lambda"
                 and pl.context.get("step_fallback", True)):
             await self._step_fallback(pl, step, step_idx, final_prompt, shared_cwd, timeout)
 
@@ -1343,9 +1352,13 @@ class PipelineManager:
                 get_best_fallback, step.agent, tried, self._pool, None)
             if next_agent is None:
                 break
-            # Fallback agents must exist locally and be ACP mode
+            # Fallback agents must exist locally and be ACP mode. A pool="lambda"
+            # agent carries no "mode" key, so it would pass the mode check while
+            # being absent from the local pool entirely — exclude it explicitly.
             next_cfg = self._agents_cfg.get(next_agent, {})
-            if not isinstance(next_cfg, dict) or next_cfg.get("mode", "acp") != "acp":
+            if (not isinstance(next_cfg, dict)
+                    or next_cfg.get("mode", "acp") != "acp"
+                    or next_cfg.get("pool") == "lambda"):
                 tried.append(next_agent)
                 continue
             step.fallback_history.append(step.agent)
@@ -1512,6 +1525,32 @@ class PipelineManager:
             # Clean up ONLY this step's own prefix. Deleting the whole pipeline prefix
             # here would race parallel steps (first finisher wipes others' in/out.tgz).
             await asyncio.to_thread(s3.delete_prefix, f"{base}/")
+
+    async def _exec_step_lambda(self, pl: Pipeline, step: PipelineStep, step_idx: int,
+                                prompt: str, cfg: dict):
+        """Execute a pipeline step via Lambda pool (serverless burst)."""
+        profile = cfg.get("profile")
+        model = cfg.get("model", "")
+        session_id = f"pipeline-{pl.pipeline_id}-lambda-{step_idx}"
+
+        try:
+            result = await self._lambda_pool.invoke(
+                prompt=prompt,
+                profile=profile,
+                model=model,
+                session_id=session_id,
+            )
+            if result.get("status") == "completed":
+                step.result = result.get("output", "")
+                step.status = "completed"
+            else:
+                step.error = result.get("error", "lambda execution failed")
+                step.status = "failed"
+        except Exception as e:
+            step.error = f"lambda invoke failed: {e}"
+            step.status = "failed"
+            log.warning("step_lambda_failed: pipeline=%s agent=%s err=%s",
+                        pl.pipeline_id, step.agent, e)
 
     async def _exec_step_pty(self, step: PipelineStep, prompt: str, cfg: dict):
         result = await run_pty_subprocess(

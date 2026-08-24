@@ -186,9 +186,20 @@ def main():
         pool._acquire_timeout = pool_cfg.get("acquire_timeout", 60)
 
     # --- Register agent handlers ---
+    # Lambda pool reference — will be populated later if enabled.
+    # Agents with pool="lambda" are registered after lambda_pool init.
+    _lambda_agent_defs: list[tuple[str, dict]] = []
+
     server = Server()
     for name, cfg in agents_cfg.items():
         mode = cfg.get("mode", "pty")
+        agent_pool_type = cfg.get("pool", "local")  # "local" (default) or "lambda"
+
+        if agent_pool_type == "lambda":
+            # Defer registration until lambda_pool is initialized
+            _lambda_agent_defs.append((name, cfg))
+            continue
+
         if mode == "acp" and pool:
             agent_profile = cfg.get("profile")
             if agent_profile:
@@ -370,6 +381,54 @@ def main():
     # --- Dynamic harness ---
     harness_routes.register(app, pool, agents_cfg, litellm_cfg, harness_binary=harness_binary)
 
+    # --- Lambda Pool (serverless burst) ---
+    from src.routes import lambda_pool as lambda_pool_routes
+    from src.agents import make_lambda_agent_handler
+    lambda_pool_cfg = config.get("lambda_pool", {})
+    lambda_pool_instance = None
+    if lambda_pool_cfg.get("enabled", False):
+        from src.lambda_pool import LambdaPool
+        lambda_pool_instance = LambdaPool(
+            function_name=lambda_pool_cfg["function_name"],
+            region=lambda_pool_cfg.get("region", "us-east-1"),
+            max_concurrent=lambda_pool_cfg.get("max_concurrent", 100),
+            timeout=lambda_pool_cfg.get("timeout", 300),
+            default_model=lambda_pool_cfg.get("default_model", "bedrock/anthropic.claude-sonnet-4-6"),
+        )
+        log.info("lambda_pool: enabled fn=%s max=%d",
+                 lambda_pool_cfg["function_name"],
+                 lambda_pool_cfg.get("max_concurrent", 100))
+
+    # Register deferred lambda agents (pool="lambda" in config).
+    # NOTE: create_app() above already snapshotted server.agents, so calling
+    # server.agent() here would register into a list nobody reads — the agent
+    # would be invisible to /runs. Insert the manifest into the live dict the
+    # SDK actually serves, the same way src/routes/harness.py registers
+    # dynamically-created harness agents.
+    _live_agents = getattr(app.state, "acp_agents", None)
+    for name, cfg in _lambda_agent_defs:
+        if not lambda_pool_instance:
+            log.warning("agent %s has pool=lambda but lambda_pool is not enabled, skipping", name)
+            continue
+        agent_profile = cfg.get("profile")
+        agent_model = cfg.get("model", lambda_pool_cfg.get("default_model", ""))
+        handler = make_lambda_agent_handler(name, lambda_pool_instance, profile=agent_profile, model=agent_model)
+        agent_metadata = None
+        if Metadata:
+            md = dict(cfg.get("metadata") or {})
+            md["tags"] = ["lambda"] + list(md.get("tags") or [])
+            agent_metadata = Metadata(**md)
+        _srv = Server()
+        _srv.agent(name=name, description=cfg.get("description", ""),
+                   metadata=agent_metadata)(handler)
+        if _live_agents is None:
+            log.error("cannot register lambda agent %s: SDK agents dict unavailable", name)
+            continue
+        _live_agents[_srv.agents[0].name] = _srv.agents[0]
+        log.info("registered: agent=%s mode=lambda pool=%s", name, lambda_pool_cfg.get("function_name"))
+
+    lambda_pool_routes.register(app, lambda_pool_instance)
+
     # --- Pipeline manager ---
     from src.pipeline import PipelineManager
     conv_workdir = srv_cfg.get("public_workdir", srv_cfg.get("conversation_workdir", "/tmp/acp-pipelines"))
@@ -381,6 +440,8 @@ def main():
                                    webhook_secret=webhook_cfg.get("secret", ""),
                                    allowed_private_targets=allowed_private_targets,
                                    prompt_store=prompt_store) if pool else None
+    if pipeline_mgr and lambda_pool_instance:
+        pipeline_mgr._lambda_pool = lambda_pool_instance
     pipelines_routes.register(app, pipeline_mgr, webhook_account_id, webhook_default_target,
                               prompt_store=prompt_store)
     admin_routes.register(app, prompt_store=prompt_store)

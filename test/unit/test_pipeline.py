@@ -886,6 +886,88 @@ async def test_step_fallback_stops_after_two_attempts(tmp_path):
     assert pool.get_or_create.await_count == 3
 
 
+# ──── Regression: lambda steps must not enter the local-ACP fallback path (v0.45.0 D5) ────
+
+
+@pytest.mark.asyncio
+async def test_failed_lambda_step_skips_local_fallback(tmp_path):
+    """A pool="lambda" agent config has no "mode" key, so cfg.get("mode", "acp")
+    reads as a local ACP agent — a failed lambda step would be retried through
+    _exec_step_acp against a pool that has no such agent."""
+    cfg = {
+        "kiro": {"command": "echo", "working_dir": "/tmp", "description": "kiro"},
+        "burst": {"pool": "lambda", "description": "burst worker", "profile": {}},
+    }
+    mgr, pool = _make_manager(tmp_path, agents_cfg=cfg)
+    pool.get_or_create = AsyncMock(side_effect=AssertionError(
+        "lambda step must never reach the local pool"))
+
+    lambda_pool = Mock()
+    lambda_pool.invoke = AsyncMock(return_value={
+        "status": "error", "error": "lambda blew up", "output": "", "duration": 1.0,
+        "session_id": "s",
+    })
+    mgr._lambda_pool = lambda_pool
+
+    pl = Pipeline(pipeline_id="lambda-fb", mode="sequence", steps=[
+        PipelineStep(agent="burst", prompt_template="task"),
+    ], context={})
+
+    fb = Mock(side_effect=AssertionError("get_best_fallback must not be consulted"))
+    for p in _PATCHES: p.start()
+    try:
+        with patch("src.pipeline.get_best_fallback", fb):
+            await mgr._exec_step(pl, pl.steps[0], "task")
+    finally:
+        for p in _PATCHES: p.stop()
+
+    step = pl.steps[0]
+    assert step.status == "failed"
+    assert step.error == "lambda blew up"
+    assert step.agent == "burst", "agent must not be swapped out by fallback"
+    assert step.fallback_history == []
+    lambda_pool.invoke.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_lambda_agent_not_chosen_as_fallback_target(tmp_path):
+    """A lambda agent must never be selected to rescue a failed local ACP step —
+    it is absent from the local pool, so _exec_step_acp would fail on it."""
+    cfg = {
+        "claude": {"command": "echo", "working_dir": "/tmp", "description": "claude"},
+        "burst": {"pool": "lambda", "description": "burst worker", "profile": {}},
+        "kiro": {"command": "echo", "working_dir": "/tmp", "description": "kiro"},
+    }
+    mgr, pool = _make_manager(tmp_path, agents_cfg=cfg)
+
+    attempted = []
+
+    async def track(agent, sid, cwd=""):
+        attempted.append(agent)
+        if agent == "kiro":
+            return _mock_conn("rescued")
+        raise AcpError(f"{agent} down")
+
+    pool.get_or_create = AsyncMock(side_effect=track)
+    pl = Pipeline(pipeline_id="lambda-fb-2", mode="sequence", steps=[
+        PipelineStep(agent="claude", prompt_template="task"),
+    ], context={})
+
+    for p in _PATCHES: p.start()
+    try:
+        # Policy offers the lambda agent first; it must be skipped, not spawned.
+        with patch("src.pipeline.get_best_fallback", side_effect=["burst", "kiro"]):
+            await mgr._exec_step(pl, pl.steps[0], "task")
+    finally:
+        for p in _PATCHES: p.stop()
+
+    step = pl.steps[0]
+    assert "burst" not in attempted, f"lambda agent was spawned locally: {attempted}"
+    assert step.agent == "kiro"
+    assert step.status == "completed"
+    assert step.result == "rescued"
+
+
 def _close_scheduled(coros):
     def close(coro):
         coros.append(coro)

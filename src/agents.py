@@ -481,6 +481,66 @@ def _record_fallback_failure(original_agent, session_id, tried_agents, current_a
         _stats.record_fallback(original_agent, current_agent, tried_agents, False)
 
 
+def make_lambda_agent_handler(agent_name: str, lambda_pool, profile: dict | None = None, model: str = ""):
+    """Lambda pool handler — transparent to callers, same interface as ACP/PTY handlers.
+
+    Invokes harness-factory via Lambda instead of local subprocess.
+    Stateless: each /runs call is an independent Lambda invocation.
+    """
+
+    async def handler(
+        input: list[Message], context: Context
+    ) -> AsyncGenerator[RunYield, RunYieldResume]:
+        prompt = "".join(part.content for msg in input for part in msg.parts if part.content)
+        if not prompt:
+            yield MessagePart(content="[error] empty prompt", content_type="text/plain")
+            return
+
+        # Unique per call. Lambda execution is stateless (no session to resume), and
+        # a stable per-agent id would collapse concurrent invocations onto one pool
+        # slot, defeating lambda_pool.max_concurrent entirely.
+        session_id = f"lambda-{agent_name}-{uuid.uuid4().hex[:12]}"
+        log.info("lambda_start: agent=%s prompt_len=%d", agent_name, len(prompt))
+        _t0 = time.time()
+
+        try:
+            result = await lambda_pool.invoke(
+                prompt=prompt,
+                profile=profile,
+                model=model,
+                session_id=session_id,
+            )
+        except RuntimeError as e:
+            log.error("lambda_capacity: agent=%s error=%s", agent_name, e)
+            yield MessagePart(
+                content=f"[error] Lambda pool at capacity: {e}",
+                content_type="text/plain")
+            if _stats:
+                await asyncio.to_thread(_stats.record, agent_name, session_id, False, time.time() - _t0)
+            return
+
+        duration = time.time() - _t0
+        status = result.get("status", "error")
+
+        if status == "completed":
+            output = result.get("output", "")
+            if output:
+                yield MessagePart(content=output, content_type="text/plain")
+            if _stats:
+                await asyncio.to_thread(_stats.record, agent_name, session_id, True, duration)
+            log.info("lambda_done: agent=%s dur=%.1fs", agent_name, duration)
+        else:
+            error_msg = result.get("error", "unknown error")
+            yield MessagePart(
+                content=f"[error] Lambda agent failed: {error_msg}",
+                content_type="text/plain")
+            if _stats:
+                await asyncio.to_thread(_stats.record, agent_name, session_id, False, duration)
+            log.warning("lambda_error: agent=%s error=%s dur=%.1fs", agent_name, error_msg, duration)
+
+    return handler
+
+
 def make_pty_agent_handler(agent_cfg: dict, verbose: bool = False):
     """Legacy PTY handler — subprocess stdout line-by-line."""
     command = agent_cfg["command"]

@@ -1,6 +1,6 @@
 [← Tutorial](tutorial.md) | [Agents →](agents.md)
 
-> **Docs:** [Getting Started](getting-started.md) · [Tutorial](tutorial.md) · [Configuration](configuration.md) · [Agents](agents.md) · [API Reference](api-reference.md) · [Pipelines](pipelines.md) · [Async Jobs](async-jobs.md) · [Webhooks](webhooks.md) · [Client Usage](client-usage.md) · [Tools Proxy](tools-proxy.md) · [Security](security.md) · [Process Pool](process-pool.md) · [Testing](testing.md) · [Troubleshooting](troubleshooting.md)
+> **Docs:** [Getting Started](getting-started.md) · [Tutorial](tutorial.md) · [Configuration](configuration.md) · [Agents](agents.md) · [API Reference](api-reference.md) · [Pipelines](pipelines.md) · [Async Jobs](async-jobs.md) · [Webhooks](webhooks.md) · [Client Usage](client-usage.md) · [Tools Proxy](tools-proxy.md) · [Security](security.md) · [Process Pool](process-pool.md) · [Lambda Burst](lambda-burst.md) · [Testing](testing.md) · [Troubleshooting](troubleshooting.md)
 
 # Configuration
 
@@ -71,6 +71,14 @@ mesh:
 
 harness:
   binary: ""                                    # path to harness-factory; empty = use PATH
+
+lambda_pool:                                    # serverless burst backend (v0.45.0)
+  enabled: false                                # off by default; /lambda-pool/* returns 503
+  function_name: "acp-bridge-harness-burst"     # CDK output FunctionName
+  region: "us-east-1"
+  max_concurrent: 100                           # Bridge-side brake; keep <= Lambda reserved concurrency
+  timeout: 300                                  # per-invocation seconds; <= Lambda function timeout
+  default_model: "bedrock/anthropic.claude-sonnet-4-6"
 
 agents:
   kiro:
@@ -151,6 +159,9 @@ Each agent entry supports these fields:
 | `working_dir` | No | Working directory for the agent subprocess (default: `/tmp`) |
 | `description` | No | Human-readable description shown in `/agents` |
 | `profile` | No | Harness Factory profile (tools, model, system prompt) |
+| `pool` | No | `"local"` (default) or `"lambda"` — run on AWS Lambda instead of a local subprocess (see [Lambda Burst](lambda-burst.md)) |
+
+A `pool: "lambda"` agent needs no `mode`, `command`, or `acp_args`: the binary lives in the Lambda layer, not on this host. It requires `lambda_pool.enabled: true`, and is skipped with a warning otherwise.
 
 ## Environment Variable References
 
@@ -437,4 +448,5 @@ When an agent exceeds its RPM or TPM limit, the request is redirected to the con
 
 - [Getting Started](getting-started.md) — installation and first run
 - [Agents](agents.md) — per-agent install commands and compatibility
+- [Lambda Burst](lambda-burst.md) — deploying and configuring the serverless burst backend
 - [Security](security.md) — auth model and deployment recommendations

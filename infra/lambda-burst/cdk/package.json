@@ -1,0 +1,22 @@
+{
+  "name": "acp-bridge-lambda-burst",
+  "version": "1.0.0",
+  "description": "CDK stack for ACP Bridge Lambda Burst (serverless harness-factory)",
+  "scripts": {
+    "build": "tsc",
+    "cdk": "cdk",
+    "deploy": "cdk deploy",
+    "synth": "cdk synth",
+    "diff": "cdk diff",
+    "destroy": "cdk destroy"
+  },
+  "dependencies": {
+    "aws-cdk-lib": "2.170.0",
+    "constructs": "^10.0.0"
+  },
+  "devDependencies": {
+    "typescript": "~5.6.0",
+    "ts-node": "^10.9.0",
+    "@types/node": "^22.0.0"
+  }
+}

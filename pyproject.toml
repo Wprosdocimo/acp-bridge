@@ -14,3 +14,8 @@ dependencies = [
 
 [tool.setuptools.dynamic]
 version = {file = "VERSION"}
+
+[dependency-groups]
+dev = [
+    "moto>=5.2.3",
+]
