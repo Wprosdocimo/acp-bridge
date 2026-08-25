@@ -1,6 +1,6 @@
 [← API Reference](api-reference.md) | [Async Jobs →](async-jobs.md)
 
-> **Docs:** [Getting Started](getting-started.md) · [Tutorial](tutorial.md) · [Configuration](configuration.md) · [Agents](agents.md) · [API Reference](api-reference.md) · [Pipelines](pipelines.md) · [Async Jobs](async-jobs.md) · [Webhooks](webhooks.md) · [Client Usage](client-usage.md) · [Tools Proxy](tools-proxy.md) · [Security](security.md) · [Process Pool](process-pool.md) · [Testing](testing.md) · [Troubleshooting](troubleshooting.md)
+> **Docs:** [Getting Started](getting-started.md) · [Tutorial](tutorial.md) · [Configuration](configuration.md) · [Agents](agents.md) · [API Reference](api-reference.md) · [Pipelines](pipelines.md) · [Async Jobs](async-jobs.md) · [Webhooks](webhooks.md) · [Client Usage](client-usage.md) · [Tools Proxy](tools-proxy.md) · [Security](security.md) · [Process Pool](process-pool.md) · [Lambda Burst](lambda-burst.md) · [Testing](testing.md) · [Troubleshooting](troubleshooting.md)
 
 # Orchestration — Multi-Agent Pipelines
 
@@ -129,6 +129,62 @@ Define `next` in context to auto-trigger the next pipeline on completion — no 
 - `next.step_prompt_template` — template for each generated step (vars: `{shared_cwd}`, `{module}`, `{files}`, `{agent}`)
 
 The next pipeline automatically inherits `shared_cwd` and `output`. Chain result is stored in `next_pipeline_id`.
+
+### Convergence Loop (`next.when`) — v0.44.0
+
+When `next` carries a `when` condition it becomes a **loop-until-converged**
+edge instead of a one-shot forward chain: a step sets a threshold, and if it is
+not met the pipeline re-runs an earlier step, up to a hard round cap. Use it for
+"QA fails → fix → redeploy → re-QA until it passes or we give up".
+
+```json
+{
+  "mode": "sequence",
+  "steps": [
+    {"agent": "kiro",     "prompt": "scaffold the game in {shared_cwd}"},
+    {"agent": "opengame", "prompt": "read round {{_loop_round}} QA report in {shared_cwd}, fix issues"},
+    {"agent": "qa-agent", "prompt": "play-test, write verdict.json + report to {shared_cwd}"}
+  ],
+  "context": {
+    "next": {
+      "when": "verdict.overall < 80",
+      "loop_back_to": 1,
+      "max_rounds": 3,
+      "when_source": "verdict.json"
+    }
+  }
+}
+```
+
+- `next.when` — threshold expression evaluated after the pipeline completes.
+  **True → loop back; False → converged, stop.** Safe subset only: comparisons
+  (`< > <= >= == !=`), `and`/`or`/`not`, attribute access, numeric/string
+  literals — evaluated via an AST whitelist, **never `eval()`**. No function
+  calls, subscripts, or imports. A missing metric makes its comparison False, so
+  an absent or partial verdict never spuriously loops.
+- `next.when_source` — file read from `shared_cwd` and namespaced by its stem
+  (default `verdict.json` → `verdict.*`), so `when` can reference
+  `verdict.overall`. The loop round is also exposed as `round`.
+- `next.loop_back_to` — step index to resume from when looping (default `0`).
+  Only that step through the end re-runs; earlier one-shot steps (e.g. scaffold)
+  keep their outputs in `shared_cwd`.
+- `next.max_rounds` — hard cap (default `3`). Reaching it stops the loop even if
+  still not converged.
+
+Each round re-submits as a fresh `sequence` pipeline reusing the same
+`shared_cwd`, with the round counter incremented. Reference it in any step
+prompt as `{{_loop_round}}` (0 on the first pass) — e.g. to read the previous
+round's report. Three outcomes each push a webhook tagged with the round:
+**converged**, **max_rounds reached**, or **stopped** (verdict missing /
+unparseable / condition error — fail-safe, does not burn rounds). Only
+`completed` pipelines are evaluated; a genuinely failed step (agent crash,
+missing declared artifact) takes the normal `failed` path and never loops.
+
+**Template support:** the whole loop def survives `POST /pipelines` template
+rendering (`input`/`vars`) — put `{{threshold}}`/`{{rounds}}` placeholders in
+`when`/`max_rounds` and they render at submit time, while `{{_loop_round}}` is a
+reserved runtime var left verbatim (it is filled per round, not at submit, and
+does not trigger a 400 for "missing variable").
 
 ### Human-in-the-Loop
 

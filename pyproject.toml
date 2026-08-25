@@ -21,3 +21,8 @@ version = {file = "VERSION"}
 # breaking acp_sdk.server.server's import. Pin below the rename until acp-sdk
 # fixes its own constraint upstream.
 override-dependencies = ["uvicorn<0.36"]
+
+[dependency-groups]
+dev = [
+    "moto>=5.2.3",
+]

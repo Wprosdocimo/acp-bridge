@@ -1,6 +1,6 @@
 [← Agents](agents.md) | [Pipelines →](pipelines.md)
 
-> **Docs:** [Getting Started](getting-started.md) · [Tutorial](tutorial.md) · [Configuration](configuration.md) · [Agents](agents.md) · [API Reference](api-reference.md) · [Pipelines](pipelines.md) · [Async Jobs](async-jobs.md) · [Webhooks](webhooks.md) · [Client Usage](client-usage.md) · [Tools Proxy](tools-proxy.md) · [Security](security.md) · [Process Pool](process-pool.md) · [Testing](testing.md) · [Troubleshooting](troubleshooting.md)
+> **Docs:** [Getting Started](getting-started.md) · [Tutorial](tutorial.md) · [Configuration](configuration.md) · [Agents](agents.md) · [API Reference](api-reference.md) · [Pipelines](pipelines.md) · [Async Jobs](async-jobs.md) · [Webhooks](webhooks.md) · [Client Usage](client-usage.md) · [Tools Proxy](tools-proxy.md) · [Security](security.md) · [Process Pool](process-pool.md) · [Lambda Burst](lambda-burst.md) · [Testing](testing.md) · [Troubleshooting](troubleshooting.md)
 
 # API Reference
 
@@ -221,6 +221,46 @@ List dynamic harness agents. Response includes `resolved_model` (populated after
 ### `DELETE /harness/{name}`
 
 Delete a dynamic harness agent.
+
+## Lambda Pool
+
+Serverless burst backend (v0.45.0). All endpoints return 503 unless `lambda_pool.enabled: true`. See [Lambda Burst](lambda-burst.md).
+
+### `GET /lambda-pool/status`
+
+Function name, region, `max_concurrent`, in-flight count, cumulative invocations and errors.
+
+### `POST /lambda-pool/invoke`
+
+Run one invocation. Returns 200 when the agent completed, 502 otherwise.
+
+```bash
+curl -X POST http://localhost:18010/lambda-pool/invoke \
+  -H "Authorization: Bearer $ACP_BRIDGE_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"prompt":"summarize this changelog"}'
+```
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `prompt` | string | Yes | Task prompt |
+| `profile` | object | No | harness-factory profile (tools, resources, agent) |
+| `model` | string | No | Overrides `lambda_pool.default_model` |
+| `timeout` | int | No | Per-invocation seconds; defaults to `lambda_pool.timeout` |
+
+### `POST /lambda-pool/invoke-batch`
+
+Fan out N prompts in parallel. Body takes `prompts` (array of `{prompt, session_id?}`) plus optional shared `profile` and `model`.
+
+Always returns one result per input, positionally aligned, with `total`/`completed`/`failed` counts. A per-item failure — including an at-capacity rejection — appears as a `status: "error"` entry for that item and never discards successful results.
+
+### `POST /lambda-pool/scale`
+
+Pre-warm containers with lightweight `__warmup__` pings. Body: `{"count": N}` (clamped to `max_concurrent`). Returns `{warmed, failed, duration}`. Best-effort: it reduces cold starts ahead of a known burst but guarantees nothing about which containers survive.
+
+### `POST /lambda-pool/drain`
+
+Wait for in-flight invocations to finish. Returns `{drained, remaining}`.
 
 ## Files
 
@@ -486,4 +526,5 @@ All requests receive an `X-Request-Id` response header. Pass your own via the re
 - [Client Usage](client-usage.md) — CLI client examples
 - [Async Jobs](async-jobs.md) — background tasks and webhooks
 - [Pipelines](pipelines.md) — multi-agent orchestration
+- [Lambda Burst](lambda-burst.md) — serverless burst backend
 - [Security](security.md) — authentication details

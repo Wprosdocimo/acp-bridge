@@ -140,6 +140,7 @@ Clients → acp-bridge (:18010)
 | [Tools Proxy](docs/tools-proxy.md) | OpenClaw tools integration |
 | [Security](docs/security.md) | Auth model, deployment shapes, prompt injection |
 | [Process Pool](docs/process-pool.md) | Connection lifecycle, LRU eviction, OOM protection |
+| [Lambda Burst](docs/lambda-burst.md) | Serverless burst backend: harness-factory agents on AWS Lambda for 100+ concurrency |
 | [Testing](docs/testing.md) | Agent compliance tests, integration test suite |
 | [Troubleshooting](docs/troubleshooting.md) | Common issues and fixes |
 | [Agent Spec](AGENT_SPEC.md) | ACP JSON-RPC protocol for writing new agents |
@@ -156,7 +157,7 @@ Clients → acp-bridge (:18010)
 
 ## Changelog
 
-See [CHANGELOG.md](CHANGELOG.md) for full version history. Current: v0.42.0
+See [CHANGELOG.md](CHANGELOG.md) for full version history. Current: v0.45.1
 
 ## Contributing
 

@@ -23,6 +23,19 @@ retention:
 harness:
   binary: ""                                    # absolute path to harness-factory binary; empty = disabled
 
+# Lambda Burst (v0.45.0) — serverless burst backend for harness-factory agents.
+# Deploy infra/lambda-burst/ via CDK first, then set function_name to the
+# CDK output. Disabled by default; when disabled, /lambda-pool/* returns 503
+# and any agent declaring pool: "lambda" is skipped with a warning.
+# See docs/lambda-burst.md.
+lambda_pool:
+  enabled: false
+  function_name: "acp-bridge-harness-burst"     # from CDK output FunctionName
+  region: "us-east-1"
+  max_concurrent: 100                           # Bridge-side brake; keep <= Lambda reserved concurrency
+  timeout: 300                                  # per-invocation seconds; must be <= Lambda function timeout
+  default_model: "bedrock/anthropic.claude-sonnet-4-6"
+
 # Persist every prompt actually sent to an agent (across job/pipeline/heartbeat
 # paths) for post-mortem and replay. Stored in SQLite next to jobs.db.
 # Records include the original template, post-render version, and the fully
@@ -241,6 +254,28 @@ agents:
   #       model: "bedrock/anthropic.claude-sonnet-4-6"
   #       system_prompt: "You are a code reviewer. Analyze diffs and produce review reports."
   #       temperature: 0.3
+
+  # Lambda Burst agent (v0.45.0) — same harness-factory profile shape, but each
+  # call runs as an AWS Lambda invocation instead of a local subprocess.
+  # Requires lambda_pool.enabled: true above. No `command`/`acp_args` needed —
+  # the binary lives in the Lambda layer, not on this host.
+  # Stateless: every /runs call is an independent invocation with no session
+  # reuse, so this suits fan-out bursts rather than multi-turn conversations.
+  # burst-worker:
+  #   enabled: true
+  #   pool: "lambda"                  # "local" (default) | "lambda"
+  #   description: "Burst worker (harness-factory on Lambda)"
+  #   model: "bedrock/anthropic.claude-sonnet-4-6"   # defaults to lambda_pool.default_model
+  #   profile:
+  #     tools:
+  #       fs: { permissions: [read, list, write] }
+  #       shell: { allowlist: [python3, pytest] }
+  #     resources:
+  #       timeout: 300s
+  #       max_turns: 20
+  #   metadata:
+  #     domains: ["coding"]
+  #     tags: ["burst", "serverless"]
 
 # --- A2A Mesh (optional, decentralized discovery — L0) ---
 # When omitted or enabled:false, the Bridge behaves exactly as today (no mesh

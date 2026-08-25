@@ -71,6 +71,23 @@ def is_available() -> bool:
     return _available
 
 
+def _object_headers(key: str) -> dict:
+    """Content headers for an object so presigned GET links behave in browsers.
+
+    Without ContentType boto3 stores everything as binary/octet-stream —
+    zips may render inline as garbage and media won't play. Archives also get
+    Content-Disposition: attachment so clicking the link downloads the file
+    (e.g. qa-evidence zips produced by harness-factory's artifact pack).
+    """
+    import mimetypes
+    ctype, _ = mimetypes.guess_type(key)
+    headers = {"ContentType": ctype or "application/octet-stream"}
+    name = os.path.basename(key)
+    if name.lower().endswith((".zip", ".tgz", ".tar.gz")):
+        headers["ContentDisposition"] = f'attachment; filename="{name}"'
+    return headers
+
+
 def upload(local_path: str, key_name: str = "") -> Optional[str]:
     """Upload file to S3, return presigned URL or None on failure."""
     if not _available:
@@ -80,7 +97,7 @@ def upload(local_path: str, key_name: str = "") -> Optional[str]:
         if not key_name:
             key_name = os.path.basename(local_path)
         key = f"{_prefix}/{key_name}"
-        s3.upload_file(local_path, _bucket, key)
+        s3.upload_file(local_path, _bucket, key, ExtraArgs=_object_headers(key))
         url = s3.generate_presigned_url(
             "get_object", Params={"Bucket": _bucket, "Key": key}, ExpiresIn=_expires,
         )
@@ -102,7 +119,7 @@ def upload_bytes(key_name: str, data: bytes) -> Optional[str]:
     try:
         key = f"{_prefix}/{key_name}"
         client = _client()
-        client.put_object(Bucket=_bucket, Key=key, Body=data)
+        client.put_object(Bucket=_bucket, Key=key, Body=data, **_object_headers(key))
         url = client.generate_presigned_url(
             "get_object", Params={"Bucket": _bucket, "Key": key}, ExpiresIn=_expires,
         )
@@ -161,7 +178,8 @@ def put_bytes(key_name: str, data: bytes) -> bool:
     if not _available:
         return False
     try:
-        _client().put_object(Bucket=_bucket, Key=f"{_prefix}/{key_name}", Body=data)
+        key = f"{_prefix}/{key_name}"
+        _client().put_object(Bucket=_bucket, Key=key, Body=data, **_object_headers(key))
         return True
     except Exception as e:
         log.warning("s3: put_bytes failed key=%s error=%s", key_name, e)
