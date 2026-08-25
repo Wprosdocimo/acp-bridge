@@ -507,7 +507,7 @@ class JobManager:
 
         return {"embeds": [embed]}
 
-    def cleanup(self, max_age: float = 3600, stuck_timeout: float = 600):
+    def cleanup(self, max_age: float = 3600, stuck_timeout: float = 1800):
         now = time.time()
         # Clean completed jobs older than max_age
         cutoff = now - max_age

@@ -586,7 +586,7 @@ def main():
         log.info("pool: max=%d max_per_agent=%d busy_timeout=%ds", pool_cfg.get("max_processes", 20), pool_cfg.get("max_per_agent", 10), busy_timeout)
     log.info("authentication configured")
     if job_mgr:
-        log.info("jobs: monitor=60s stuck_timeout=600s webhook=%s", webhook_cfg.get("url", "(none)"))
+        log.info("jobs: monitor=60s stuck_timeout=1800s webhook=%s", webhook_cfg.get("url", "(none)"))
     webhook_token = webhook_cfg.get("token", "")
     if webhook_cfg.get("url") and not webhook_token and webhook_cfg.get("format", "openclaw") != "generic":
         log.warning("webhook: url is set but token is empty — webhook calls will fail with 401. "
