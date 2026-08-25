@@ -8,16 +8,38 @@
 # .cargo, .local/share/{mise,kiro-cli,opencode,uv,pipx,ai-memory,...} etc.
 # all come back `--bind` already), read-only otherwise, and .aws/.ssh/.gnupg
 # are never mounted at all (built-in DOTDIR_DENY, confirmed absent from the
-# dry-run output). This covers every harness this bridge spawns except one:
+# dry-run output). This claim is STALE as of ai-jail 1.20.1 (2026-08-25):
+# confirmed live that only the *direct* child command (uv) is actually
+# bind-mounted now — ~/.cursor, ~/.config/cursor, ~/.local/bin/*, and every
+# mise-managed harness install dir all came back missing from the sandbox
+# even though --dry-run's PATH still lists them, causing FileNotFoundError /
+# "Authentication required" on every non-uv subprocess spawn (a real stuck
+# `cursor` job is what surfaced this).
+#
+# A second, independent bug compounds this: any TILDE-prefixed path in THIS
+# file's rw_maps/ro_maps silently fails to mount once merged through
+# ai-jail's trusted-project-config path (`os.path.exists()` false inside the
+# sandbox for a `~/...` entry, while the byte-identical path written as
+# `/home/wprosdocimo/...` mounts correctly) — confirmed live 2026-08-25 by
+# testing both forms back to back.
+#
+# A THIRD bug (also 2026-08-25): even with absolute paths, ~/.cursor,
+# ~/.config/cursor, and ~/.local/share/cursor-agent all resolve correctly in
+# `ai-jail status` output but produce *no bwrap mount at all* — `--dry-run`
+# omits them entirely, no warning. Looks like a precedence bug where ai-jail's
+# own dotdir auto-discovery for a path it also happens to recognize silently
+# overrides an explicit project-level map instead of merging with it (the
+# unrelated /mnt/wsl/.../Projects entry below, not under any recognized
+# dotdir, mounts fine). The identical paths as CLI --map/--rw-map flags DO
+# mount correctly, so those three are wired on the systemd unit's ExecStart
+# instead (see acp-bridge.service comments) — not duplicated here to avoid
+# two sources of truth silently drifting.
+#
+# Same class of gap likely affects kiro/opencode/claude-agent-acp too and
+# will need the same explicit-map treatment (probably also via ExecStart,
+# not this file) when one of those is next exercised and found broken.
 
 rw_maps = [
-    # cursor-agent (pty-mode harness, see config.yaml) writes session/chat
-    # state under ~/.cursor (cli-config.json, chats/, projects/) — comes
-    # back read-only by default since it's not in ai-jail's built-in
-    # writable-dotdir list. ~/.config/cursor (auth.json) is already RW via
-    # the native `.config` passthrough, no extra entry needed for that one.
-    "~/.cursor",
-
     # Job callers pass an arbitrary `cwd` (e.g. mcp-server/server.py's
     # acp_call/acp_submit_job tools) so a spawned harness can operate on any
     # of the user's actual repos, not just this bridge's own directory.
