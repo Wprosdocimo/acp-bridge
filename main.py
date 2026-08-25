@@ -105,7 +105,15 @@ def main():
     parser.add_argument("--host", help="Override listen host")
     parser.add_argument("--port", type=int, help="Override listen port")
     parser.add_argument("--config", default="config.yaml", help="Config file path")
-    parser.add_argument("--verbose", "-v", action="store_true")
+    # ai-jail 1.20.1's arg scanner rejects a child flag placed after `--`
+    # once that flag also matches one of ai-jail's own flag names (--verbose
+    # became one in ~v1.19) — env fallback sidesteps the collision without
+    # giving up ai-jail's uv-specific PATH/mount wiring (which only applies
+    # when uv is the direct child command, not behind a bash -c wrapper).
+    parser.add_argument(
+        "--verbose", "-v", action="store_true",
+        default=os.environ.get("ACP_BRIDGE_VERBOSE", "").lower() in ("1", "true", "yes"),
+    )
     parser.add_argument("--ui", action="store_true", help="Enable Web UI at /ui")
     args = parser.parse_args()
 

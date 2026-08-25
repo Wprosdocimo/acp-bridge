@@ -72,3 +72,14 @@ deny_path_exceptions = [
 no_docker = true
 no_gpu = true
 no_display = true
+
+# The bridge itself needs network: it binds 127.0.0.1:18010 for inbound
+# requests and calls out to LLM provider APIs. ai-jail's network default is
+# off unconditionally (README: "capabilities default off: network, GPU,
+# display..."); confirmed live 2026-08-25 that --exec mode unshares the net
+# namespace same as any other mode, so without this the bridge starts and
+# logs "Uvicorn running on http://127.0.0.1:18010" but is unreachable even
+# from the host loopback. Requires this project to be listed in the global
+# ~/.ai-jail's trust_project_config, since granting a capability from a
+# project-level .ai-jail is otherwise ignored (v1.19.0+).
+network = true
