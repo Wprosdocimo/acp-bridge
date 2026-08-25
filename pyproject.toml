@@ -25,4 +25,9 @@ override-dependencies = ["uvicorn<0.36"]
 [dependency-groups]
 dev = [
     "moto>=5.2.3",
+    # Not declared upstream even though test/unit relies on both (21 files use
+    # pytest.mark.asyncio) — upstream's own CI never catches this because the
+    # `test` job is gated on `lint`, which is currently failing separately.
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
 ]
