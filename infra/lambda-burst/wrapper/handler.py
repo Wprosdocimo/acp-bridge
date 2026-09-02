@@ -291,8 +291,26 @@ def _recv_response(proc, msg_id: int, timeout: float = 30) -> dict:
     raise TimeoutError(f"No response for id={msg_id} within {timeout}s")
 
 
+def _fs_path_allowed(path: str) -> tuple[bool, str]:
+    """Confine Lambda agent fs access to the ephemeral /tmp workspace.
+
+    The Lambda runs in an isolated, throwaway environment, but there is still
+    no reason for an agent to read outside /tmp (which is the only writable and
+    the only interesting location). realpath defeats ../ and symlink escape.
+    """
+    rp = os.path.realpath(os.path.abspath(os.path.expanduser(path or "")))
+    if rp == "/tmp" or rp.startswith("/tmp/"):
+        return True, ""
+    return False, "outside_tmp"
+
+
 def _reply_fs_read(proc, msg: dict):
     path = msg.get("params", {}).get("path", "")
+    allowed, reason = _fs_path_allowed(path)
+    if not allowed:
+        _send(proc, {"jsonrpc": "2.0", "id": msg["id"],
+                     "result": {"content": f"ERROR: EACCES: sandbox denied ({reason}): {path}"}})
+        return
     try:
         with open(path) as f:
             content = f.read()
@@ -306,6 +324,11 @@ def _reply_fs_write(proc, msg: dict):
     params = msg.get("params", {})
     fpath = params.get("path", "")
     content = params.get("content", "")
+    allowed, reason = _fs_path_allowed(fpath)
+    if not allowed:
+        _send(proc, {"jsonrpc": "2.0", "id": msg["id"],
+                     "error": {"code": -1, "message": f"sandbox denied ({reason}): {fpath}"}})
+        return
     try:
         dirn = os.path.dirname(fpath)
         if dirn:

@@ -188,12 +188,56 @@ def main():
     # Ensure all working dirs exist
     for cfg in agents_cfg.values():
         os.makedirs(cfg.get("working_dir", "/tmp"), exist_ok=True)
+
+    # --- FS sandbox (three-tier trust) + audit ---
+    from src.fs_audit import FsAuditStore
+    from src.sandbox import DEFAULT_BLACKLIST, LEVEL_NAMES, Sandbox, normalize_level
+
+    _srv_cfg = config.get("server", {})
+    sandbox_cfg = config.get("sandbox", {})
+    # Allowed roots for level-0 agents: every agent working_dir + the shared
+    # workspace dirs (public/pipeline/upload) + any operator-configured roots.
+    _default_roots = [c.get("working_dir", "") for c in agents_cfg.values() if isinstance(c, dict)]
+    _default_roots += [
+        _srv_cfg.get("public_workdir", "/tmp/acp-public"),
+        _srv_cfg.get("conversation_workdir", "/tmp/acp-pipelines"),
+        "/tmp/acp-pipelines",
+        _srv_cfg.get("upload_dir", "/tmp/acp-uploads"),
+    ]
+    _allowed_roots = [r for r in (_default_roots + sandbox_cfg.get("allowed_roots", [])) if r]
+    _blacklist = sandbox_cfg.get("blacklist") or DEFAULT_BLACKLIST
+    sandbox = Sandbox(
+        allowed_roots=_allowed_roots,
+        blacklist=_blacklist,
+        enabled=sandbox_cfg.get("enabled", True),
+    )
+    fs_audit = FsAuditStore(db_path=config.get("prompt_log", {}).get("db_path", "data/jobs.db"))
+    # Startup warning for any explicitly unrestricted (level 2) agent.
+    for _an, _ac in agents_cfg.items():
+        if isinstance(_ac, dict) and normalize_level(_ac.get("trust")) >= 2:
+            log.warning(
+                "SECURITY: agent=%s is trust=unrestricted (level 2) — it can access ANY "
+                "path on this host. All fs ops are audited. Set a lower trust unless intended.",
+                _an,
+            )
+    if sandbox.enabled:
+        log.info(
+            "sandbox: enabled roots=%d blacklist=%d agents=%s",
+            len(sandbox.roots),
+            len(_blacklist),
+            {a: LEVEL_NAMES[normalize_level(c.get("trust"))] for a, c in agents_cfg.items() if isinstance(c, dict)},
+        )
+    else:
+        log.warning("sandbox: DISABLED — agents have unrestricted fs access")
+
     pool = (
         AcpProcessPool(
             agents_config=acp_agents,
             max_processes=pool_cfg.get("max_processes", 20),
             max_per_agent=pool_cfg.get("max_per_agent", 10),
             verbose=args.verbose,
+            sandbox=sandbox,
+            fs_audit=fs_audit,
         )
         if acp_agents
         else None
@@ -519,7 +563,7 @@ def main():
     pipelines_routes.register(
         app, pipeline_mgr, webhook_account_id, webhook_default_target, prompt_store=prompt_store
     )
-    admin_routes.register(app, prompt_store=prompt_store)
+    admin_routes.register(app, prompt_store=prompt_store, fs_audit=fs_audit)
 
     # --- A2A Mesh L0 (optional, decentralized discovery) ---
     mesh_cfg = config.get("mesh", {})
@@ -633,6 +677,8 @@ def main():
             await asyncio.to_thread(stats_collector.delete_old)
             if prompt_store:
                 await asyncio.to_thread(prompt_store.cleanup_older_than, prompt_retention)
+            if fs_audit:
+                await asyncio.to_thread(fs_audit.cleanup_older_than, prompt_retention)
             if chat_store:
                 await asyncio.to_thread(chat_store.delete_old, chat_retention)
             await asyncio.to_thread(litellm_routes.delete_old, usage_retention)

@@ -29,6 +29,10 @@ class AcpConnection:
     session_id: str
     proc: asyncio.subprocess.Process
     verbose: bool = False
+    cwd: str = ""
+    trust_level: int = 0
+    sandbox: "Any | None" = None
+    fs_audit: "Any | None" = None
     _req_id: int = field(default=0, init=False)
     _pending: dict[int, asyncio.Future] = field(default_factory=dict, init=False)
     _reader_task: asyncio.Task | None = field(default=None, init=False)
@@ -103,7 +107,43 @@ class AcpConnection:
         self._fs_tasks.add(task)
         task.add_done_callback(self._fs_tasks.discard)
 
+    def _fs_check(self, operation: str, path: str, size: int = 0) -> tuple[bool, str]:
+        """Apply sandbox policy + write an audit record. Returns (allowed, reason)."""
+        allowed, reason = (True, "")
+        if self.sandbox is not None:
+            # The connection's own cwd is always an implicit allowed root for
+            # level 0, so a legit shared_cwd/working_dir agent can read its own
+            # files even if that dir wasn't pre-registered as a global root.
+            extra = [self.cwd] if self.cwd else None
+            allowed, reason = self.sandbox.check_path(self.trust_level, path, extra_roots=extra)
+        if self.fs_audit is not None:
+            self.fs_audit.record(
+                agent=self.agent,
+                trust_level=self.trust_level,
+                operation=operation,
+                path=path,
+                cwd=self.cwd,
+                size=size,
+                outcome="allowed" if allowed else "denied",
+                deny_reason=reason,
+            )
+        if not allowed:
+            log.warning(
+                "fs_denied: agent=%s level=%d op=%s path=%s reason=%s",
+                self.agent,
+                self.trust_level,
+                operation,
+                path,
+                reason,
+            )
+        return allowed, reason
+
     async def _fs_read_reply(self, msg_id: int, path: str) -> None:
+        allowed, reason = self._fs_check("read", path)
+        if not allowed:
+            self._auto_reply(msg_id, {"content": f"ERROR: EACCES: sandbox denied ({reason}): {path}"})
+            return
+
         def _read():
             with open(path) as f:
                 return f.read()
@@ -115,6 +155,11 @@ class AcpConnection:
             self._auto_reply(msg_id, {"content": f"ERROR: ENOENT: {path}"})
 
     async def _fs_write_reply(self, msg_id: int, path: str, content: str) -> None:
+        allowed, reason = self._fs_check("write", path, size=len(content or ""))
+        if not allowed:
+            self._auto_reply_error(msg_id, -1, f"sandbox denied ({reason}): {path}")
+            return
+
         def _write():
             if os.path.dirname(path):
                 os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -431,11 +476,15 @@ class AcpProcessPool:
         max_processes: int = 20,
         max_per_agent: int = 10,
         verbose: bool = False,
+        sandbox=None,
+        fs_audit=None,
     ):
         self._config = agents_config
         self._max = max_processes
         self._max_per_agent = max_per_agent
         self._verbose = verbose
+        self._sandbox = sandbox
+        self._fs_audit = fs_audit
         self._connections: dict[tuple[str, str], AcpConnection] = {}
         self._memory_limit_pct: float = 80.0
         self._acquire_timeout: float = 60.0  # seconds to wait for a free slot; 0 = fail fast
@@ -449,6 +498,12 @@ class AcpProcessPool:
         if agent.startswith("harness"):
             return "harness"
         return agent
+
+    def _trust_level(self, agent: str) -> int:
+        """Resolve an agent's fs trust level from config (default 0)."""
+        from src.sandbox import normalize_level
+
+        return normalize_level(self._config.get(agent, {}).get("trust"))
 
     def _count_agent(self, agent: str) -> int:
         group = self._agent_group(agent)
@@ -524,6 +579,29 @@ class AcpProcessPool:
         profile: dict | None = None,
         resume_session_id: str = "",
     ) -> AcpConnection:
+        # Sandbox admission: a client-supplied cwd override (via /runs metadata
+        # or pipeline shared_cwd) is attacker-controllable, so it must itself be
+        # a legal location for this agent's trust level. Otherwise cwd=/ would
+        # bypass level-0 fs bounds. Empty cwd falls back to config working_dir.
+        if cwd and self._sandbox is not None:
+            level = self._trust_level(agent)
+            ok, reason = self._sandbox.check_cwd(level, cwd)
+            if not ok:
+                if self._fs_audit is not None:
+                    self._fs_audit.record(
+                        agent=agent,
+                        trust_level=level,
+                        operation="cwd",
+                        path=cwd,
+                        cwd=cwd,
+                        outcome="denied",
+                        deny_reason=reason,
+                        session_id=session_id,
+                    )
+                log.warning(
+                    "cwd_denied: agent=%s level=%d cwd=%s reason=%s", agent, level, cwd, reason
+                )
+                raise AcpError(f"sandbox denied cwd ({reason}): {cwd}")
         # Bounded wait: when the pool is full, poll for a freed slot instead of
         # failing immediately. The wait loop sits OUTSIDE self._lock so other
         # agents' acquisitions proceed while we wait.
@@ -665,7 +743,16 @@ class AcpProcessPool:
             limit=1024 * 1024,  # 1MB line buffer (default 64KB too small for large agent responses)
         )
 
-        conn = AcpConnection(agent=agent, session_id=session_id, proc=proc, verbose=self._verbose)
+        conn = AcpConnection(
+            agent=agent,
+            session_id=session_id,
+            proc=proc,
+            verbose=self._verbose,
+            cwd=cwd,
+            trust_level=self._trust_level(agent),
+            sandbox=self._sandbox,
+            fs_audit=self._fs_audit,
+        )
         if is_rebuild:
             conn.session_reset = True
         try:

@@ -138,7 +138,7 @@ Clients → acp-bridge (:18010)
 | [Webhooks](docs/webhooks.md) | Webhook formats, auth (token vs HMAC), payload examples |
 | [Client Usage](docs/client-usage.md) | `acp-client.sh` CLI client |
 | [Tools Proxy](docs/tools-proxy.md) | OpenClaw tools integration |
-| [Security](docs/security.md) | Auth model, deployment shapes, prompt injection |
+| [Security](docs/security.md) | Auth model, filesystem sandbox (three-tier trust + fs audit), deployment shapes, prompt injection |
 | [Process Pool](docs/process-pool.md) | Connection lifecycle, LRU eviction, OOM protection |
 | [Lambda Burst](docs/lambda-burst.md) | Serverless burst backend: harness-factory agents on AWS Lambda for 100+ concurrency |
 | [Testing](docs/testing.md) | Agent compliance tests, integration test suite |
@@ -157,7 +157,7 @@ Clients → acp-bridge (:18010)
 
 ## Changelog
 
-See [CHANGELOG.md](CHANGELOG.md) for full version history. Current: v0.45.3
+See [CHANGELOG.md](CHANGELOG.md) for full version history. Current: v0.46.0
 
 ## Contributing
 
