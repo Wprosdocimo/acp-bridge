@@ -29,6 +29,10 @@ class AcpConnection:
     session_id: str
     proc: asyncio.subprocess.Process
     verbose: bool = False
+    cwd: str = ""
+    trust_level: int = 0
+    sandbox: "Any | None" = None
+    fs_audit: "Any | None" = None
     _req_id: int = field(default=0, init=False)
     _pending: dict[int, asyncio.Future] = field(default_factory=dict, init=False)
     _reader_task: asyncio.Task | None = field(default=None, init=False)
@@ -122,10 +126,47 @@ class AcpConnection:
         self._fs_tasks.add(task)
         task.add_done_callback(self._fs_tasks.discard)
 
+    def _fs_check(self, operation: str, path: str, size: int = 0) -> tuple[bool, str]:
+        """Apply sandbox policy + write an audit record. Returns (allowed, reason)."""
+        allowed, reason = (True, "")
+        if self.sandbox is not None:
+            # The connection's own cwd is always an implicit allowed root for
+            # level 0, so a legit shared_cwd/working_dir agent can read its own
+            # files even if that dir wasn't pre-registered as a global root.
+            extra = [self.cwd] if self.cwd else None
+            allowed, reason = self.sandbox.check_path(self.trust_level, path, extra_roots=extra)
+        if self.fs_audit is not None:
+            self.fs_audit.record(
+                agent=self.agent,
+                trust_level=self.trust_level,
+                operation=operation,
+                path=path,
+                cwd=self.cwd,
+                size=size,
+                outcome="allowed" if allowed else "denied",
+                deny_reason=reason,
+            )
+        if not allowed:
+            log.warning(
+                "fs_denied: agent=%s level=%d op=%s path=%s reason=%s",
+                self.agent,
+                self.trust_level,
+                operation,
+                path,
+                reason,
+            )
+        return allowed, reason
+
     async def _fs_read_reply(self, msg_id: int, path: str) -> None:
+        allowed, reason = self._fs_check("read", path)
+        if not allowed:
+            self._auto_reply(msg_id, {"content": f"ERROR: EACCES: sandbox denied ({reason}): {path}"})
+            return
+
         def _read():
             with open(path) as f:
                 return f.read()
+
         try:
             content = await asyncio.to_thread(_read)
             self._auto_reply(msg_id, {"content": content})
@@ -133,11 +174,17 @@ class AcpConnection:
             self._auto_reply(msg_id, {"content": f"ERROR: ENOENT: {path}"})
 
     async def _fs_write_reply(self, msg_id: int, path: str, content: str) -> None:
+        allowed, reason = self._fs_check("write", path, size=len(content or ""))
+        if not allowed:
+            self._auto_reply_error(msg_id, -1, f"sandbox denied ({reason}): {path}")
+            return
+
         def _write():
             if os.path.dirname(path):
                 os.makedirs(os.path.dirname(path), exist_ok=True)
             with open(path, "w") as f:
                 f.write(content)
+
         try:
             await asyncio.to_thread(_write)
             self._auto_reply(msg_id, {})
@@ -183,11 +230,17 @@ class AcpConnection:
                 else:
                     # Auto-reply permission requests (e.g. claude-agent-acp)
                     if msg.get("method") == "session/request_permission" and msg_id is not None:
-                        log.info("auto-allow permission: %s",
-                                 msg.get("params", {}).get("toolCall", {}).get("title", "?"))
-                        option_id = self._pick_always_allow_option(msg.get("params", {}).get("options", []))
-                        self._auto_reply(msg_id, {"outcome": {"outcome": "selected",
-                                                              "optionId": option_id}})
+                        log.info(
+                            "auto-allow permission: %s",
+                            msg.get("params", {}).get("toolCall", {}).get("title", "?"),
+                        )
+                        option_id = self._pick_always_allow_option(
+                            msg.get("params", {}).get("options", [])
+                        )
+                        self._auto_reply(
+                            msg_id,
+                            {"outcome": {"outcome": "selected", "optionId": option_id}},
+                        )
                     # Auto-reply fs requests (e.g. opengame ACP) — file IO runs
                     # in a thread so a large read/write can't stall the loop
                     elif msg.get("method") == "fs/read_text_file" and msg_id is not None:
@@ -195,8 +248,11 @@ class AcpConnection:
                         self._spawn_fs_reply(self._fs_read_reply(msg_id, path))
                     elif msg.get("method") == "fs/write_text_file" and msg_id is not None:
                         params = msg.get("params", {})
-                        self._spawn_fs_reply(self._fs_write_reply(
-                            msg_id, params.get("path", ""), params.get("content", "")))
+                        self._spawn_fs_reply(
+                            self._fs_write_reply(
+                                msg_id, params.get("path", ""), params.get("content", "")
+                            )
+                        )
                     for q in self._notification_queues.values():
                         q.put_nowait(msg)
         except Exception as e:
@@ -235,16 +291,21 @@ class AcpConnection:
 
     async def initialize(self) -> dict:
         self._start_reader()
-        result = await self._send_request("initialize", {
-            "protocolVersion": 1,
-            "clientCapabilities": {
-                "fs": {"readTextFile": True, "writeTextFile": True},
+        result = await self._send_request(
+            "initialize",
+            {
+                "protocolVersion": 1,
+                "clientCapabilities": {
+                    "fs": {"readTextFile": True, "writeTextFile": True},
+                },
+                "clientInfo": {"name": "acp-bridge", "version": _VERSION},
             },
-            "clientInfo": {"name": "acp-bridge", "version": _VERSION},
-        })
-        log.info("initialized: agent=%s version=%s",
-                 result.get("agentInfo", {}).get("name"),
-                 result.get("agentInfo", {}).get("version"))
+        )
+        log.info(
+            "initialized: agent=%s version=%s",
+            result.get("agentInfo", {}).get("name"),
+            result.get("agentInfo", {}).get("version"),
+        )
         # Auto-authenticate if agent requires it and OPENAI_API_KEY is set
         auth_methods = result.get("authMethods", [])
         if auth_methods:
@@ -272,9 +333,11 @@ class AcpConnection:
             activated = result.get("activated") if isinstance(result, dict) else None
             if isinstance(activated, dict) and activated.get("resolvedModel"):
                 self.resolved_model = activated["resolvedModel"]
-            log.info("session created: acp_session=%s%s",
-                     self.acp_session_id,
-                     f" model={self.resolved_model}" if getattr(self, "resolved_model", None) else "")
+            log.info(
+                "session created: acp_session=%s%s",
+                self.acp_session_id,
+                f" model={self.resolved_model}" if getattr(self, "resolved_model", None) else "",
+            )
             return self.acp_session_id
         finally:
             self._unsubscribe(sub_id)
@@ -314,7 +377,9 @@ class AcpConnection:
         update = params.get("update", {})
         return update.get("sessionUpdate") == "agent_thought_chunk"
 
-    async def session_prompt(self, prompt: "str | list[dict]", idle_timeout: float = 300) -> AsyncIterator[dict]:
+    async def session_prompt(
+        self, prompt: "str | list[dict]", idle_timeout: float = 300
+    ) -> AsyncIterator[dict]:
         self._busy = True
         self.last_active = time.time()
         last_event_time = time.time()
@@ -322,7 +387,9 @@ class AcpConnection:
         req_id = self._next_id()
         parts = prompt if isinstance(prompt, list) else [{"type": "text", "text": prompt}]
         msg = {
-            "jsonrpc": "2.0", "id": req_id, "method": "session/prompt",
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "method": "session/prompt",
             "params": {
                 "sessionId": self.acp_session_id,
                 "prompt": parts,
@@ -340,9 +407,14 @@ class AcpConnection:
                     try:
                         await self.session_cancel()
                     except Exception:
-                        log.debug("session_cancel_failed: agent=%s session=%s",
-                                  self.agent, self.session_id)
-                    yield {"_prompt_result": {"error": {"code": -1, "message": "agent_timeout (idle)"}}}
+                        log.debug(
+                            "session_cancel_failed: agent=%s session=%s",
+                            self.agent,
+                            self.session_id,
+                        )
+                    yield {
+                        "_prompt_result": {"error": {"code": -1, "message": "agent_timeout (idle)"}}
+                    }
                     return
                 try:
                     notification = await asyncio.wait_for(q.get(), timeout=1.0)
@@ -370,7 +442,9 @@ class AcpConnection:
                 if n is not None:
                     yield n
 
-            result = fut.result() if fut.done() else {"error": {"code": -1, "message": "no response"}}
+            result = (
+                fut.result() if fut.done() else {"error": {"code": -1, "message": "no response"}}
+            )
             yield {"_prompt_result": result}
         finally:
             pending = self._pending.pop(req_id, None)
@@ -381,9 +455,12 @@ class AcpConnection:
             self._busy = False
 
     async def session_cancel(self) -> None:
-        await self._send_notification("session/cancel", {
-            "sessionId": self.acp_session_id,
-        })
+        await self._send_notification(
+            "session/cancel",
+            {
+                "sessionId": self.acp_session_id,
+            },
+        )
 
     async def kill(self) -> None:
         if self.alive:
@@ -405,9 +482,7 @@ class AcpConnection:
         if not self.alive:
             return False
         try:
-            await asyncio.wait_for(
-                self._send_request("ping", {}), timeout=timeout
-            )
+            await asyncio.wait_for(self._send_request("ping", {}), timeout=timeout)
             return True
         except AcpError:
             # Agent replied with an error (method not found) — still alive
@@ -417,11 +492,21 @@ class AcpConnection:
 
 
 class AcpProcessPool:
-    def __init__(self, agents_config: dict, max_processes: int = 20, max_per_agent: int = 10, verbose: bool = False):
+    def __init__(
+        self,
+        agents_config: dict,
+        max_processes: int = 20,
+        max_per_agent: int = 10,
+        verbose: bool = False,
+        sandbox=None,
+        fs_audit=None,
+    ):
         self._config = agents_config
         self._max = max_processes
         self._max_per_agent = max_per_agent
         self._verbose = verbose
+        self._sandbox = sandbox
+        self._fs_audit = fs_audit
         self._connections: dict[tuple[str, str], AcpConnection] = {}
         self._memory_limit_pct: float = 80.0
         self._acquire_timeout: float = 60.0  # seconds to wait for a free slot; 0 = fail fast
@@ -432,33 +517,40 @@ class AcpProcessPool:
     def _agent_group(agent: str) -> str:
         """Map agent name to its group for shared limits.
         All harness-* agents share the 'harness' group."""
-        if agent.startswith("harness") :
+        if agent.startswith("harness"):
             return "harness"
         return agent
+
+    def _trust_level(self, agent: str) -> int:
+        """Resolve an agent's fs trust level from config (default 0)."""
+        from src.sandbox import normalize_level
+
+        return normalize_level(self._config.get(agent, {}).get("trust"))
 
     def _count_agent(self, agent: str) -> int:
         group = self._agent_group(agent)
         return sum(1 for (a, _) in self._connections if self._agent_group(a) == group)
 
-    def _lru_idle(self, agent: str | None = None, exact_match: bool = False) -> tuple[str, str] | None:
+    def _lru_idle(
+        self, agent: str | None = None, exact_match: bool = False
+    ) -> tuple[str, str] | None:
         """Return key of least-recently-used idle connection, optionally filtered by agent."""
         if agent is not None:
             if exact_match:
                 candidates = [
-                    (k, c) for k, c in self._connections.items()
+                    (k, c)
+                    for k, c in self._connections.items()
                     if not c._busy and c.alive and k[0] == agent
                 ]
             else:
                 group = self._agent_group(agent)
                 candidates = [
-                    (k, c) for k, c in self._connections.items()
+                    (k, c)
+                    for k, c in self._connections.items()
                     if not c._busy and c.alive and self._agent_group(k[0]) == group
                 ]
         else:
-            candidates = [
-                (k, c) for k, c in self._connections.items()
-                if not c._busy and c.alive
-            ]
+            candidates = [(k, c) for k, c in self._connections.items() if not c._busy and c.alive]
         if not candidates:
             return None
         return min(candidates, key=lambda x: x[1].last_active)[0]
@@ -467,12 +559,22 @@ class AcpProcessPool:
         """Kill and remove a connection from the pool."""
         conn = self._connections.pop(key, None)
         if conn:
-            log.info("lru_evict: agent=%s session=%s idle=%.0fs",
-                     key[0], key[1], time.time() - conn.last_active)
+            log.info(
+                "lru_evict: agent=%s session=%s idle=%.0fs",
+                key[0],
+                key[1],
+                time.time() - conn.last_active,
+            )
             await conn.kill()
             self._save_pids()
 
-    async def _reuse(self, old_key: tuple[str, str], new_key: tuple[str, str], cwd: str, profile: dict | None = None) -> AcpConnection:
+    async def _reuse(
+        self,
+        old_key: tuple[str, str],
+        new_key: tuple[str, str],
+        cwd: str,
+        profile: dict | None = None,
+    ) -> AcpConnection:
         """Reuse an existing connection under a new session key — reset context via session/new."""
         conn = self._connections.pop(old_key)
         new_agent, new_session_id = new_key
@@ -480,7 +582,9 @@ class AcpProcessPool:
         conn.session_id = new_session_id
         conn.session_reset = True
         try:
-            await conn.session_new(cwd or self._config[new_agent].get("working_dir", "/tmp"), profile=profile)
+            await conn.session_new(
+                cwd or self._config[new_agent].get("working_dir", "/tmp"), profile=profile
+            )
         except Exception:
             await conn.kill()
             self._save_pids()
@@ -489,7 +593,37 @@ class AcpProcessPool:
         self._save_pids()
         return conn
 
-    async def get_or_create(self, agent: str, session_id: str, cwd: str = "", profile: dict | None = None, resume_session_id: str = "") -> AcpConnection:
+    async def get_or_create(
+        self,
+        agent: str,
+        session_id: str,
+        cwd: str = "",
+        profile: dict | None = None,
+        resume_session_id: str = "",
+    ) -> AcpConnection:
+        # Sandbox admission: a client-supplied cwd override (via /runs metadata
+        # or pipeline shared_cwd) is attacker-controllable, so it must itself be
+        # a legal location for this agent's trust level. Otherwise cwd=/ would
+        # bypass level-0 fs bounds. Empty cwd falls back to config working_dir.
+        if cwd and self._sandbox is not None:
+            level = self._trust_level(agent)
+            ok, reason = self._sandbox.check_cwd(level, cwd)
+            if not ok:
+                if self._fs_audit is not None:
+                    self._fs_audit.record(
+                        agent=agent,
+                        trust_level=level,
+                        operation="cwd",
+                        path=cwd,
+                        cwd=cwd,
+                        outcome="denied",
+                        deny_reason=reason,
+                        session_id=session_id,
+                    )
+                log.warning(
+                    "cwd_denied: agent=%s level=%d cwd=%s reason=%s", agent, level, cwd, reason
+                )
+                raise AcpError(f"sandbox denied cwd ({reason}): {cwd}")
         # Bounded wait: when the pool is full, poll for a freed slot instead of
         # failing immediately. The wait loop sits OUTSIDE self._lock so other
         # agents' acquisitions proceed while we wait.
@@ -498,17 +632,30 @@ class AcpProcessPool:
         while True:
             try:
                 async with self._lock:
-                    return await self._get_or_create_unlocked(agent, session_id, cwd, profile, resume_session_id)
+                    return await self._get_or_create_unlocked(
+                        agent, session_id, cwd, profile, resume_session_id
+                    )
             except PoolExhaustedError:
                 if self._acquire_timeout <= 0 or time.monotonic() + 2.0 > deadline:
                     raise
                 if not waited:
                     waited = True
-                    log.info("pool_full_waiting: agent=%s session=%s timeout=%.0fs",
-                             agent, session_id, self._acquire_timeout)
+                    log.info(
+                        "pool_full_waiting: agent=%s session=%s timeout=%.0fs",
+                        agent,
+                        session_id,
+                        self._acquire_timeout,
+                    )
                 await asyncio.sleep(2.0)
 
-    async def _get_or_create_unlocked(self, agent: str, session_id: str, cwd: str = "", profile: dict | None = None, resume_session_id: str = "") -> AcpConnection:
+    async def _get_or_create_unlocked(
+        self,
+        agent: str,
+        session_id: str,
+        cwd: str = "",
+        profile: dict | None = None,
+        resume_session_id: str = "",
+    ) -> AcpConnection:
         key = (agent, session_id)
         conn = self._connections.get(key)
 
@@ -531,7 +678,8 @@ class AcpProcessPool:
                 # Reap dead connections for this agent before giving up
                 group = self._agent_group(agent)
                 dead_keys = [
-                    k for k, c in self._connections.items()
+                    k
+                    for k, c in self._connections.items()
                     if self._agent_group(k[0]) == group and not c.alive
                 ]
                 for dk in dead_keys:
@@ -540,7 +688,9 @@ class AcpProcessPool:
                         log.warning("reap_dead: agent=%s session=%s (process exited)", dk[0], dk[1])
                         await dc.kill()
                 if not dead_keys:
-                    raise PoolExhaustedError(f"per-agent limit for {agent} ({self._max_per_agent}), all busy")
+                    raise PoolExhaustedError(
+                        f"per-agent limit for {agent} ({self._max_per_agent}), all busy"
+                    )
                 self._save_pids()
             else:
                 await self._evict(lru)
@@ -559,12 +709,29 @@ class AcpProcessPool:
         if not agent_cfg:
             raise AcpError(f"agent not found: {agent}")
 
-        conn = await self._spawn(agent, session_id, agent_cfg, is_rebuild=is_rebuild, cwd_override=cwd, profile=profile, resume_session_id=resume_session_id)
+        conn = await self._spawn(
+            agent,
+            session_id,
+            agent_cfg,
+            is_rebuild=is_rebuild,
+            cwd_override=cwd,
+            profile=profile,
+            resume_session_id=resume_session_id,
+        )
         self._connections[key] = conn
         self._save_pids()
         return conn
 
-    async def _spawn(self, agent: str, session_id: str, cfg: dict, is_rebuild: bool = False, cwd_override: str = "", profile: dict | None = None, resume_session_id: str = "") -> AcpConnection:
+    async def _spawn(
+        self,
+        agent: str,
+        session_id: str,
+        cfg: dict,
+        is_rebuild: bool = False,
+        cwd_override: str = "",
+        profile: dict | None = None,
+        resume_session_id: str = "",
+    ) -> AcpConnection:
         command = cfg["command"]
         acp_args = cfg.get("acp_args", ["acp"])
         cwd = cwd_override or cfg.get("working_dir", "/tmp")
@@ -578,9 +745,17 @@ class AcpProcessPool:
             else:
                 env[k] = str(v)
 
-        log.info("spawning: agent=%s session=%s cmd=%s %s rebuild=%s", agent, session_id, command, acp_args, is_rebuild)
+        log.info(
+            "spawning: agent=%s session=%s cmd=%s %s rebuild=%s",
+            agent,
+            session_id,
+            command,
+            acp_args,
+            is_rebuild,
+        )
         proc = await asyncio.create_subprocess_exec(
-            command, *acp_args,
+            command,
+            *acp_args,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
@@ -590,7 +765,16 @@ class AcpProcessPool:
             limit=1024 * 1024,  # 1MB line buffer (default 64KB too small for large agent responses)
         )
 
-        conn = AcpConnection(agent=agent, session_id=session_id, proc=proc, verbose=self._verbose)
+        conn = AcpConnection(
+            agent=agent,
+            session_id=session_id,
+            proc=proc,
+            verbose=self._verbose,
+            cwd=cwd,
+            trust_level=self._trust_level(agent),
+            sandbox=self._sandbox,
+            fs_audit=self._fs_audit,
+        )
         if is_rebuild:
             conn.session_reset = True
         try:
@@ -663,8 +847,13 @@ class AcpProcessPool:
             if not lru:
                 log.warning("memory_pressure: %.0f%% used, no idle connections to evict", pct)
                 break
-            log.warning("memory_evict: %.0f%% used (limit %.0f%%), evicting agent=%s session=%s",
-                        pct, self._memory_limit_pct, lru[0], lru[1])
+            log.warning(
+                "memory_evict: %.0f%% used (limit %.0f%%), evicting agent=%s session=%s",
+                pct,
+                self._memory_limit_pct,
+                lru[0],
+                lru[1],
+            )
             await self._evict(lru)
             evicted += 1
             pct = self._mem_used_pct()
@@ -682,8 +871,12 @@ class AcpProcessPool:
             if conn._busy:
                 # Kill connections stuck busy beyond timeout
                 if now - conn.last_active > busy_timeout:
-                    log.warning("health_check: agent=%s session=%s stuck busy for %.0fs, killing",
-                                key[0], key[1], now - conn.last_active)
+                    log.warning(
+                        "health_check: agent=%s session=%s stuck busy for %.0fs, killing",
+                        key[0],
+                        key[1],
+                        now - conn.last_active,
+                    )
                     dead.append(key)
                 continue
             ok = await conn.ping(timeout=10)
@@ -692,7 +885,9 @@ class AcpProcessPool:
         for key in dead:
             conn = self._connections.pop(key, None)
             if conn:
-                log.warning("health_check: agent=%s session=%s unresponsive, killing", key[0], key[1])
+                log.warning(
+                    "health_check: agent=%s session=%s unresponsive, killing", key[0], key[1]
+                )
                 await conn.kill()
         if dead:
             log.info("health_check: removed %d dead connections", len(dead))

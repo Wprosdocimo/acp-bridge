@@ -1,7 +1,9 @@
 """Session list/resume endpoints for ACP agents that support session persistence."""
 
 import logging
+
 from fastapi import HTTPException, Query
+
 from ..acp_client import AcpProcessPool
 
 log = logging.getLogger("acp-bridge.sessions")
@@ -27,6 +29,7 @@ def register(app, pool: AcpProcessPool, agents_cfg: dict):
 
         # Need a live connection to query sessions — get or spawn one
         import uuid
+
         temp_session = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{agent_name}:session-list"))
         try:
             conn = await pool.get_or_create(agent_name, temp_session, cwd=effective_cwd)

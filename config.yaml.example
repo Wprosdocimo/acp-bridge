@@ -13,6 +13,26 @@ pool:
   max_per_agent: 10
   acquire_timeout: 60                           # seconds to wait for a free slot when pool is full; 0 = fail fast
 
+# Filesystem sandbox — three-tier trust model for agent fs access (v0.46.0).
+# Each agent's `trust` field sets its level (default 0 when unset):
+#   0 sandboxed    — fs path must be within an allowed root (agent working_dir
+#                    + public_workdir / pipeline / upload dirs + allowed_roots)
+#   1 workspace    — free fs access EXCEPT the security-sensitive blacklist
+#   2 unrestricted — no restriction (startup warning; still audited)
+# Client-supplied cwd overrides (/runs metadata, pipeline shared_cwd) are held
+# to the same policy, so cwd=/ can't bypass level-0 bounds. All fs ops and
+# denied cwds are recorded in fs_audit — query via GET /admin/fs-audit.
+sandbox:
+  enabled: true
+  allowed_roots: []                             # extra level-0 roots beyond working_dir + shared dirs
+  # Omit `blacklist` to use the built-in default (see src/sandbox.py).
+  # blacklist:
+  #   - "~/.aws"
+  #   - "~/.ssh"
+  #   - "/etc"
+  #   - "**/.env"
+  #   - "**/*.pem"
+
 # SQLite data retention (v0.41.0) — pruned every 60s by the cleanup loop.
 # prompt_log retention is configured separately via prompt_log.retention_days.
 retention:
@@ -84,6 +104,7 @@ agents:
     command: "kiro-cli"
     acp_args: ["acp", "--trust-all-tools"]
     working_dir: "/tmp"
+    # trust: "workspace"   # level 1 — free fs access except security blacklist. Default is level 0 (sandboxed).
     description: "Kiro CLI agent"
     metadata:
       author: {name: "AWS", url: "https://kiro.dev"}

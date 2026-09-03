@@ -34,9 +34,19 @@ from src.acp_client import AcpProcessPool
 from src.agents import make_acp_agent_handler, make_pty_agent_handler, ping_loop
 from src.jobs import JobManager
 from src.prompt_log import PromptStore
+from src.routes import admin as admin_routes
+from src.routes import chat as chat_routes
+from src.routes import files as files_routes
+from src.routes import harness as harness_routes
+from src.routes import health as health_routes
+from src.routes import jobs as jobs_routes
+from src.routes import pipelines as pipelines_routes
+from src.routes import sessions as sessions_routes
+from src.routes import stats as stats_routes
+from src.routes import templates as templates_routes
+from src.routes import tools as tools_routes
 from src.security import SecurityMiddleware
 from src.stats import StatsCollector
-from src.routes import jobs as jobs_routes, tools as tools_routes, health as health_routes, chat as chat_routes, files as files_routes, pipelines as pipelines_routes, stats as stats_routes, templates as templates_routes, harness as harness_routes, admin as admin_routes, sessions as sessions_routes
 
 try:
     from acp_sdk.models.models import Metadata
@@ -50,6 +60,7 @@ log = logging.getLogger("acp-bridge")
 
 def setup_logging(verbose: bool):
     from src.trace import TraceIdFilter
+
     level = logging.DEBUG if verbose else logging.INFO
     logging.basicConfig(
         level=level,
@@ -119,13 +130,12 @@ def main():
 
     setup_logging(args.verbose)
 
-    auto_mode = False
     if os.path.exists(args.config):
         config = load_config(args.config)
     else:
         from src.auto_detect import build_config
+
         config = build_config()
-        auto_mode = True
         agents = config.get("agents", {})
         if not agents:
             log.error("No config.yaml found and no agent CLIs detected in PATH")
@@ -133,7 +143,7 @@ def main():
         token = config["security"]["auth_token"]
         print(f"\n⚡ Zero-config mode: detected {len(agents)} agent(s): {', '.join(agents)}")
         print(f"🔑 Auth token: {token}")
-        print(f"   (set ACP_BRIDGE_TOKEN env to use a fixed token)\n")
+        print("   (set ACP_BRIDGE_TOKEN env to use a fixed token)\n")
 
     # --- Agents ---
     agents_cfg = {k: v for k, v in config.get("agents", {}).items() if v.get("enabled")}
@@ -155,6 +165,7 @@ def main():
     required_by = litellm_cfg.get("required_by", [])
     if litellm_url and required_by:
         import httpx
+
         try:
             litellm_env = litellm_cfg.get("env", {})
             api_key = litellm_env.get("LITELLM_API_KEY", "")
@@ -171,7 +182,9 @@ def main():
             for name in disabled:
                 del agents_cfg[name]
             if disabled:
-                print(f"\n⚠️  LiteLLM ({litellm_url}) is not reachable — disabled agents: {', '.join(disabled)}\n")
+                print(
+                    f"\n⚠️  LiteLLM ({litellm_url}) is not reachable — disabled agents: {', '.join(disabled)}\n"
+                )
             if not agents_cfg:
                 log.error("All agents disabled due to litellm dependency")
                 sys.exit(1)
@@ -183,12 +196,60 @@ def main():
     # Ensure all working dirs exist
     for cfg in agents_cfg.values():
         os.makedirs(cfg.get("working_dir", "/tmp"), exist_ok=True)
-    pool = AcpProcessPool(
-        agents_config=acp_agents,
-        max_processes=pool_cfg.get("max_processes", 20),
-        max_per_agent=pool_cfg.get("max_per_agent", 10),
-        verbose=args.verbose,
-    ) if acp_agents else None
+
+    # --- FS sandbox (three-tier trust) + audit ---
+    from src.fs_audit import FsAuditStore
+    from src.sandbox import DEFAULT_BLACKLIST, LEVEL_NAMES, Sandbox, normalize_level
+
+    _srv_cfg = config.get("server", {})
+    sandbox_cfg = config.get("sandbox", {})
+    # Allowed roots for level-0 agents: every agent working_dir + the shared
+    # workspace dirs (public/pipeline/upload) + any operator-configured roots.
+    _default_roots = [c.get("working_dir", "") for c in agents_cfg.values() if isinstance(c, dict)]
+    _default_roots += [
+        _srv_cfg.get("public_workdir", "/tmp/acp-public"),
+        _srv_cfg.get("conversation_workdir", "/tmp/acp-pipelines"),
+        "/tmp/acp-pipelines",
+        _srv_cfg.get("upload_dir", "/tmp/acp-uploads"),
+    ]
+    _allowed_roots = [r for r in (_default_roots + sandbox_cfg.get("allowed_roots", [])) if r]
+    _blacklist = sandbox_cfg.get("blacklist") or DEFAULT_BLACKLIST
+    sandbox = Sandbox(
+        allowed_roots=_allowed_roots,
+        blacklist=_blacklist,
+        enabled=sandbox_cfg.get("enabled", True),
+    )
+    fs_audit = FsAuditStore(db_path=config.get("prompt_log", {}).get("db_path", "data/jobs.db"))
+    # Startup warning for any explicitly unrestricted (level 2) agent.
+    for _an, _ac in agents_cfg.items():
+        if isinstance(_ac, dict) and normalize_level(_ac.get("trust")) >= 2:
+            log.warning(
+                "SECURITY: agent=%s is trust=unrestricted (level 2) — it can access ANY "
+                "path on this host. All fs ops are audited. Set a lower trust unless intended.",
+                _an,
+            )
+    if sandbox.enabled:
+        log.info(
+            "sandbox: enabled roots=%d blacklist=%d agents=%s",
+            len(sandbox.roots),
+            len(_blacklist),
+            {a: LEVEL_NAMES[normalize_level(c.get("trust"))] for a, c in agents_cfg.items() if isinstance(c, dict)},
+        )
+    else:
+        log.warning("sandbox: DISABLED — agents have unrestricted fs access")
+
+    pool = (
+        AcpProcessPool(
+            agents_config=acp_agents,
+            max_processes=pool_cfg.get("max_processes", 20),
+            max_per_agent=pool_cfg.get("max_per_agent", 10),
+            verbose=args.verbose,
+            sandbox=sandbox,
+            fs_audit=fs_audit,
+        )
+        if acp_agents
+        else None
+    )
     if pool:
         pool._memory_limit_pct = pool_cfg.get("memory_limit_percent", 80)
         pool._acquire_timeout = pool_cfg.get("acquire_timeout", 60)
@@ -226,8 +287,9 @@ def main():
             md = dict(cfg.get("metadata") or {})
             md["tags"] = ["local"] + list(md.get("tags") or [])
             agent_metadata = Metadata(**md)
-        server.agent(name=name, description=cfg.get("description", ""),
-                     metadata=agent_metadata)(handler)
+        server.agent(name=name, description=cfg.get("description", ""), metadata=agent_metadata)(
+            handler
+        )
         log.info("registered: agent=%s mode=%s cmd=%s", name, mode, cfg.get("command"))
 
     # --- Config values ---
@@ -256,6 +318,7 @@ def main():
 
     # --- S3 file sharing ---
     from src import s3 as s3_mod
+
     s3_cfg = config.get("s3", {})
     s3_ok = s3_mod.init(
         bucket=s3_cfg.get("bucket", ""),
@@ -271,35 +334,39 @@ def main():
     # watcher), and cancellation-watcher reaping (zombie watchers accumulated
     # per finished run). Root cause of the 2026-08-11 100%-CPU incident.
     from datetime import timedelta
+
     from src.acp_patch import PerKeyEventMemoryStore, apply_executor_patch
+
     apply_executor_patch()
-    app = create_app(*server.agents,
-                     store=PerKeyEventMemoryStore(limit=1000, ttl=timedelta(hours=1)))
+    app = create_app(
+        *server.agents, store=PerKeyEventMemoryStore(limit=1000, ttl=timedelta(hours=1))
+    )
 
     # Extract the SDK's internal agents dict for dynamic registration
     for route in app.routes:
-        if hasattr(route, 'name') and route.name == 'list_agents':
+        if hasattr(route, "name") and route.name == "list_agents":
             for cell in route.endpoint.__closure__:
                 try:
                     val = cell.cell_contents
-                    if isinstance(val, dict) and all(
-                        hasattr(v, 'name') for v in val.values()
-                    ):
+                    if isinstance(val, dict) and all(hasattr(v, "name") for v in val.values()):
                         app.state.acp_agents = val
                         break
                 except ValueError:
                     pass
             break
 
-    app.add_middleware(SecurityMiddleware,
-                       allowed_ips=sec_cfg.get("allowed_ips", []),
-                       auth_token=sec_cfg.get("auth_token", ""),
-                       rate_limit=sec_cfg.get("rate_limit", 60),
-                       rate_window=sec_cfg.get("rate_window", 60),
-                       max_body=sec_cfg.get("max_body_bytes", 3 * 1024 * 1024))
+    app.add_middleware(
+        SecurityMiddleware,
+        allowed_ips=sec_cfg.get("allowed_ips", []),
+        auth_token=sec_cfg.get("auth_token", ""),
+        rate_limit=sec_cfg.get("rate_limit", 60),
+        rate_window=sec_cfg.get("rate_window", 60),
+        max_body=sec_cfg.get("max_body_bytes", 3 * 1024 * 1024),
+    )
 
     # trace_id middleware — added last so it runs first (Starlette is LIFO)
     from src.trace import TraceIdMiddleware
+
     app.add_middleware(TraceIdMiddleware)
 
     # --- Job manager ---
@@ -314,23 +381,33 @@ def main():
             redact=pl_cfg.get("redact_secrets", True),
             max_size=int(pl_cfg.get("max_size", 1_048_576)),
         )
-        log.info("prompt_log enabled (redact=%s, max_size=%d)",
-                 pl_cfg.get("redact_secrets", True),
-                 int(pl_cfg.get("max_size", 1_048_576)))
-    job_mgr = JobManager(
-        pool=pool, pty_configs=pty_agents,
-        webhook_url=webhook_cfg.get("url", ""),
-        webhook_token=webhook_cfg.get("token", ""),
-        webhook_format=webhook_cfg.get("format", "openclaw"),
-        webhook_secret=webhook_cfg.get("secret", ""),
-        base_url=base_url,
-        prompt_store=prompt_store,
-        allowed_private_targets=allowed_private_targets,
-    ) if (pool or pty_agents) else None
+        log.info(
+            "prompt_log enabled (redact=%s, max_size=%d)",
+            pl_cfg.get("redact_secrets", True),
+            int(pl_cfg.get("max_size", 1_048_576)),
+        )
+    job_mgr = (
+        JobManager(
+            pool=pool,
+            pty_configs=pty_agents,
+            webhook_url=webhook_cfg.get("url", ""),
+            webhook_token=webhook_cfg.get("token", ""),
+            webhook_format=webhook_cfg.get("format", "openclaw"),
+            webhook_secret=webhook_cfg.get("secret", ""),
+            base_url=base_url,
+            prompt_store=prompt_store,
+            allowed_private_targets=allowed_private_targets,
+        )
+        if (pool or pty_agents)
+        else None
+    )
 
     # --- Fallback chain (load from YAML, fallback to built-in defaults) ---
     from src.agents import load_fallback_chain
-    _config_dir = os.path.dirname(os.path.abspath(args.config)) if os.path.exists(args.config) else "."
+
+    _config_dir = (
+        os.path.dirname(os.path.abspath(args.config)) if os.path.exists(args.config) else "."
+    )
     load_fallback_chain(os.path.join(_config_dir, "fallback-chain.yaml"))
 
     # --- Register routes ---
@@ -339,11 +416,20 @@ def main():
     webhook_default_target = webhook_cfg.get("target", webhook_cfg.get("discord_target", ""))
     openclaw_url = webhook_cfg.get("url", "")
 
-    health_routes.register(app, _VERSION, start_time, agents_cfg, pool, ttl_hours,
-                           job_mgr=job_mgr, litellm_cfg=litellm_cfg)
+    health_routes.register(
+        app,
+        _VERSION,
+        start_time,
+        agents_cfg,
+        pool,
+        ttl_hours,
+        job_mgr=job_mgr,
+        litellm_cfg=litellm_cfg,
+    )
     sessions_routes.register(app, pool, agents_cfg)
-    jobs_routes.register(app, job_mgr, webhook_account_id, webhook_default_target,
-                         prompt_store=prompt_store)
+    jobs_routes.register(
+        app, job_mgr, webhook_account_id, webhook_default_target, prompt_store=prompt_store
+    )
     tools_routes.register(app, openclaw_url, webhook_cfg.get("token", ""), webhook_account_id)
     upload_dir = srv_cfg.get("upload_dir", "/tmp/acp-uploads")
     os.environ["ACP_UPLOAD_DIR"] = upload_dir
@@ -351,12 +437,14 @@ def main():
 
     # --- LiteLLM proxy + usage tracking ---
     from src.routes import litellm_proxy as litellm_routes
+
     litellm_routes.register(app, litellm_cfg)
 
     # --- Stats ---
     stats_collector = StatsCollector()
     stats_routes.register(app, stats_collector)
     import src.agents as _agents_mod
+
     _agents_mod._stats = stats_collector
     if job_mgr:
         job_mgr._stats = stats_collector
@@ -364,24 +452,33 @@ def main():
 
     # --- Heartbeat / env awareness ---
     from src.heartbeat import EnvCollector
+
     heartbeat_cfg = config.get("heartbeat", {})
     env_collector = None
     if heartbeat_cfg.get("enabled", False) and pool:
         active_hours_cfg = heartbeat_cfg.get("active_hours", [0, 24])
-        env_collector = EnvCollector(pool, agents_cfg, port=port,
-                                     client_script=heartbeat_cfg.get("client_script", ""),
-                                     job_mgr=job_mgr,
-                                     language=heartbeat_cfg.get("language", "en"),
-                                     shared_workdir=srv_cfg.get("public_workdir", "/tmp/acp-public"),
-                                     active_hours=tuple(active_hours_cfg),
-                                     timezone_offset=heartbeat_cfg.get("timezone_offset", 8))
+        env_collector = EnvCollector(
+            pool,
+            agents_cfg,
+            port=port,
+            client_script=heartbeat_cfg.get("client_script", ""),
+            job_mgr=job_mgr,
+            language=heartbeat_cfg.get("language", "en"),
+            shared_workdir=srv_cfg.get("public_workdir", "/tmp/acp-public"),
+            active_hours=tuple(active_hours_cfg),
+            timezone_offset=heartbeat_cfg.get("timezone_offset", 8),
+        )
         _agents_mod._env = env_collector
         from src.heartbeat import register as heartbeat_register
+
         heartbeat_register(app, env_collector, pool, prompt_store=prompt_store)
-        log.info("heartbeat: env injection enabled for %s (active %d:00-%d:00 UTC+%d)",
-                 sorted(env_collector._enabled_agents),
-                 active_hours_cfg[0], active_hours_cfg[1],
-                 heartbeat_cfg.get("timezone_offset", 8))
+        log.info(
+            "heartbeat: env injection enabled for %s (active %d:00-%d:00 UTC+%d)",
+            sorted(env_collector._enabled_agents),
+            active_hours_cfg[0],
+            active_hours_cfg[1],
+            heartbeat_cfg.get("timezone_offset", 8),
+        )
 
     # --- Templates ---
     templates_routes.register(app)
@@ -390,22 +487,28 @@ def main():
     harness_routes.register(app, pool, agents_cfg, litellm_cfg, harness_binary=harness_binary)
 
     # --- Lambda Pool (serverless burst) ---
-    from src.routes import lambda_pool as lambda_pool_routes
     from src.agents import make_lambda_agent_handler
+    from src.routes import lambda_pool as lambda_pool_routes
+
     lambda_pool_cfg = config.get("lambda_pool", {})
     lambda_pool_instance = None
     if lambda_pool_cfg.get("enabled", False):
         from src.lambda_pool import LambdaPool
+
         lambda_pool_instance = LambdaPool(
             function_name=lambda_pool_cfg["function_name"],
             region=lambda_pool_cfg.get("region", "us-east-1"),
             max_concurrent=lambda_pool_cfg.get("max_concurrent", 100),
             timeout=lambda_pool_cfg.get("timeout", 300),
-            default_model=lambda_pool_cfg.get("default_model", "bedrock/anthropic.claude-sonnet-4-6"),
+            default_model=lambda_pool_cfg.get(
+                "default_model", "bedrock/anthropic.claude-sonnet-4-6"
+            ),
         )
-        log.info("lambda_pool: enabled fn=%s max=%d",
-                 lambda_pool_cfg["function_name"],
-                 lambda_pool_cfg.get("max_concurrent", 100))
+        log.info(
+            "lambda_pool: enabled fn=%s max=%d",
+            lambda_pool_cfg["function_name"],
+            lambda_pool_cfg.get("max_concurrent", 100),
+        )
 
     # Register deferred lambda agents (pool="lambda" in config).
     # NOTE: create_app() above already snapshotted server.agents, so calling
@@ -420,39 +523,55 @@ def main():
             continue
         agent_profile = cfg.get("profile")
         agent_model = cfg.get("model", lambda_pool_cfg.get("default_model", ""))
-        handler = make_lambda_agent_handler(name, lambda_pool_instance, profile=agent_profile, model=agent_model)
+        handler = make_lambda_agent_handler(
+            name, lambda_pool_instance, profile=agent_profile, model=agent_model
+        )
         agent_metadata = None
         if Metadata:
             md = dict(cfg.get("metadata") or {})
             md["tags"] = ["lambda"] + list(md.get("tags") or [])
             agent_metadata = Metadata(**md)
         _srv = Server()
-        _srv.agent(name=name, description=cfg.get("description", ""),
-                   metadata=agent_metadata)(handler)
+        _srv.agent(name=name, description=cfg.get("description", ""), metadata=agent_metadata)(
+            handler
+        )
         if _live_agents is None:
             log.error("cannot register lambda agent %s: SDK agents dict unavailable", name)
             continue
         _live_agents[_srv.agents[0].name] = _srv.agents[0]
-        log.info("registered: agent=%s mode=lambda pool=%s", name, lambda_pool_cfg.get("function_name"))
+        log.info(
+            "registered: agent=%s mode=lambda pool=%s", name, lambda_pool_cfg.get("function_name")
+        )
 
     lambda_pool_routes.register(app, lambda_pool_instance)
 
     # --- Pipeline manager ---
     from src.pipeline import PipelineManager
-    conv_workdir = srv_cfg.get("public_workdir", srv_cfg.get("conversation_workdir", "/tmp/acp-pipelines"))
+
+    conv_workdir = srv_cfg.get(
+        "public_workdir", srv_cfg.get("conversation_workdir", "/tmp/acp-pipelines")
+    )
     agents_cfg["_public_workdir"] = conv_workdir
-    pipeline_mgr = PipelineManager(pool, agents_cfg,
-                                   webhook_url=webhook_cfg.get("url", ""),
-                                   webhook_token=webhook_cfg.get("token", ""),
-                                   webhook_format=webhook_cfg.get("format", "openclaw"),
-                                   webhook_secret=webhook_cfg.get("secret", ""),
-                                   allowed_private_targets=allowed_private_targets,
-                                   prompt_store=prompt_store) if pool else None
+    pipeline_mgr = (
+        PipelineManager(
+            pool,
+            agents_cfg,
+            webhook_url=webhook_cfg.get("url", ""),
+            webhook_token=webhook_cfg.get("token", ""),
+            webhook_format=webhook_cfg.get("format", "openclaw"),
+            webhook_secret=webhook_cfg.get("secret", ""),
+            allowed_private_targets=allowed_private_targets,
+            prompt_store=prompt_store,
+        )
+        if pool
+        else None
+    )
     if pipeline_mgr and lambda_pool_instance:
         pipeline_mgr._lambda_pool = lambda_pool_instance
-    pipelines_routes.register(app, pipeline_mgr, webhook_account_id, webhook_default_target,
-                              prompt_store=prompt_store)
-    admin_routes.register(app, prompt_store=prompt_store)
+    pipelines_routes.register(
+        app, pipeline_mgr, webhook_account_id, webhook_default_target, prompt_store=prompt_store
+    )
+    admin_routes.register(app, prompt_store=prompt_store, fs_audit=fs_audit)
 
     # --- A2A Mesh L0 (optional, decentralized discovery) ---
     mesh_cfg = config.get("mesh", {})
@@ -460,29 +579,33 @@ def main():
     if mesh_cfg.get("enabled", False):
         from src.mesh import MeshManager, resolve_mesh_token
         from src.routes import mesh as mesh_routes
+
         try:
             mesh_token = resolve_mesh_token(mesh_cfg)
         except ValueError as e:
             log.error(str(e))
             log.error("Set mesh.token (e.g. via ${MESH_TOKEN}) or disable mesh.enabled")
             sys.exit(1)
-        mesh_mgr = MeshManager(**{
-            "node_name": mesh_cfg.get("node_id", f"{host}:{port}"),
-            "self_url": mesh_cfg.get("self_url", base_url),
-            "version": _VERSION,
-            "agents_cfg": {k: v for k, v in agents_cfg.items() if isinstance(v, dict)},
-            "config_path": args.config,
-            "seeds": mesh_cfg.get("seeds", []),
-            "token": mesh_token,
-            "announce_interval": mesh_cfg.get("announce_interval", 300),
-            "max_hops": mesh_cfg.get("max_hops", 1),
-            "pricing": mesh_cfg.get("pricing"),
-            "mode": mesh_cfg.get("mode", ""),
-            "private_url": mesh_cfg.get("private_url", ""),
-            "public_url": mesh_cfg.get("public_url", ""),
-        })
+        mesh_mgr = MeshManager(
+            **{
+                "node_name": mesh_cfg.get("node_id", f"{host}:{port}"),
+                "self_url": mesh_cfg.get("self_url", base_url),
+                "version": _VERSION,
+                "agents_cfg": {k: v for k, v in agents_cfg.items() if isinstance(v, dict)},
+                "config_path": args.config,
+                "seeds": mesh_cfg.get("seeds", []),
+                "token": mesh_token,
+                "announce_interval": mesh_cfg.get("announce_interval", 300),
+                "max_hops": mesh_cfg.get("max_hops", 1),
+                "pricing": mesh_cfg.get("pricing"),
+                "mode": mesh_cfg.get("mode", ""),
+                "private_url": mesh_cfg.get("private_url", ""),
+                "public_url": mesh_cfg.get("public_url", ""),
+            }
+        )
         # L1: A2A Server — reuse existing agent handlers (no new exec logic).
         from src.mesh_a2a import A2AAdapter
+
         _remote_skills: set = set()
         a2a_adapter = A2AAdapter(
             agents_provider=lambda: getattr(app.state, "acp_agents", {}),
@@ -494,7 +617,9 @@ def main():
         mesh_routes.register(app, mesh_mgr, adapter=a2a_adapter)
         # L2: A2A Client — register remote handlers for peer-only skills each cycle.
         from src.mesh_client import reconcile as _mesh_reconcile
+
         mesh_mgr.on_cycle = lambda: _mesh_reconcile(app, mesh_mgr, _remote_skills)
+
         # L3: let pipeline steps relay shared_cwd to the peer owning a remote skill.
         def _mesh_resolver(agent_name):
             if agent_name not in _remote_skills:
@@ -503,10 +628,15 @@ def main():
                 if p.healthy and agent_name in p.skills:
                     return (p.url, mesh_mgr.token)
             return None
+
         if pipeline_mgr:
             pipeline_mgr._mesh_resolver = _mesh_resolver
-        log.info("mesh: enabled node=%s seeds=%s agents=%s (L1 a2a on, L2 routing on, L3 workspace relay on)",
-                 mesh_mgr.node_name, mesh_mgr.seeds, mesh_mgr._agent_names())
+        log.info(
+            "mesh: enabled node=%s seeds=%s agents=%s (L1 a2a on, L2 routing on, L3 workspace relay on)",
+            mesh_mgr.node_name,
+            mesh_mgr.seeds,
+            mesh_mgr._agent_names(),
+        )
         # Wire mesh agents into heartbeat snapshot
         if env_collector:
             env_collector._acp_agents_provider = lambda: getattr(app.state, "acp_agents", {})
@@ -531,6 +661,7 @@ def main():
 
     async def cleanup_loop():
         from src import workspace
+
         while True:
             await asyncio.sleep(60)
             if pool:
@@ -545,12 +676,17 @@ def main():
                 pipeline_mgr.cleanup()
                 await asyncio.to_thread(pipeline_mgr._store.delete_old, pipeline_retention)
                 if ws_ttl_hours > 0:
-                    await asyncio.to_thread(workspace.sweep, conv_workdir,
-                                            ws_ttl_hours * 3600,
-                                            pipeline_mgr.active_cwds())
+                    await asyncio.to_thread(
+                        workspace.sweep,
+                        conv_workdir,
+                        ws_ttl_hours * 3600,
+                        pipeline_mgr.active_cwds(),
+                    )
             await asyncio.to_thread(stats_collector.delete_old)
             if prompt_store:
                 await asyncio.to_thread(prompt_store.cleanup_older_than, prompt_retention)
+            if fs_audit:
+                await asyncio.to_thread(fs_audit.cleanup_older_than, prompt_retention)
             if chat_store:
                 await asyncio.to_thread(chat_store.delete_old, chat_retention)
             await asyncio.to_thread(litellm_routes.delete_old, usage_retention)
@@ -561,9 +697,9 @@ def main():
 
     async def _heartbeat_ping_agent(agent_name: str):
         """Ping agent with LLM prompt for environment awareness."""
-        import uuid
-        from src.sse import transform_notification
         from src.heartbeat import HEARTBEAT_IDLE_TIMEOUT
+        from src.sse import transform_notification
+
         cfg = agents_cfg.get(agent_name, {})
         if not isinstance(cfg, dict) or cfg.get("mode") != "acp":
             return
@@ -575,26 +711,44 @@ def main():
             return
         t0 = time.time()
         try:
-            conn = await pool.get_or_create(agent_name, session_id,
-                                            cwd=cfg.get("working_dir", "/tmp"))
+            conn = await pool.get_or_create(
+                agent_name, session_id, cwd=cfg.get("working_dir", "/tmp")
+            )
             parts = []
-            async for notification in conn.session_prompt(prompt, idle_timeout=HEARTBEAT_IDLE_TIMEOUT):
+            async for notification in conn.session_prompt(
+                prompt, idle_timeout=HEARTBEAT_IDLE_TIMEOUT
+            ):
                 if "_prompt_result" in notification:
                     from src.agents import _record_acp_usage
+
                     await asyncio.to_thread(
-                        _record_acp_usage, agent_name, notification["_prompt_result"], time.time() - t0)
+                        _record_acp_usage,
+                        agent_name,
+                        notification["_prompt_result"],
+                        time.time() - t0,
+                    )
                     break
                 event = transform_notification(notification)
                 if event and event["type"] == "message.part":
                     parts.append(event["content"])
             response = env_collector.clean_response("".join(parts).strip())
             silent = env_collector.is_silent(response)
-            env_collector.record(agent_name, prompt, response, silent, time.time() - t0,
-                                 snapshot=env_collector.get_snapshot())
+            env_collector.record(
+                agent_name,
+                prompt,
+                response,
+                silent,
+                time.time() - t0,
+                snapshot=env_collector.get_snapshot(),
+            )
             env_collector.increment_round(agent_name)
-            log.info("heartbeat_auto: agent=%s silent=%s dur=%.1fs round=%d",
-                     agent_name, silent, time.time() - t0,
-                     env_collector._round_counter.get(agent_name, 0))
+            log.info(
+                "heartbeat_auto: agent=%s silent=%s dur=%.1fs round=%d",
+                agent_name,
+                silent,
+                time.time() - t0,
+                env_collector._round_counter.get(agent_name, 0),
+            )
         except Exception as e:
             log.warning("heartbeat_auto: agent=%s error=%s", agent_name, e)
 
@@ -652,14 +806,25 @@ def main():
     # --- Logging ---
     log.info("allowed_ips=%s", sec_cfg.get("allowed_ips", []))
     if pool:
-        log.info("pool: max=%d max_per_agent=%d busy_timeout=%ds", pool_cfg.get("max_processes", 20), pool_cfg.get("max_per_agent", 10), busy_timeout)
+        log.info(
+            "pool: max=%d max_per_agent=%d busy_timeout=%ds",
+            pool_cfg.get("max_processes", 20),
+            pool_cfg.get("max_per_agent", 10),
+            busy_timeout,
+        )
     log.info("authentication configured")
     if job_mgr:
         log.info("jobs: monitor=60s stuck_timeout=1800s webhook=%s", webhook_cfg.get("url", "(none)"))
     webhook_token = webhook_cfg.get("token", "")
-    if webhook_cfg.get("url") and not webhook_token and webhook_cfg.get("format", "openclaw") != "generic":
-        log.warning("webhook: url is set but token is empty — webhook calls will fail with 401. "
-                    "Set OPENCLAW_TOKEN env var or check config.yaml")
+    if (
+        webhook_cfg.get("url")
+        and not webhook_token
+        and webhook_cfg.get("format", "openclaw") != "generic"
+    ):
+        log.warning(
+            "webhook: url is set but token is empty — webhook calls will fail with 401. "
+            "Set OPENCLAW_TOKEN env var or check config.yaml"
+        )
     if openclaw_url:
         log.info("tools_proxy: openclaw=%s", openclaw_url.replace("/tools/invoke", ""))
     if ui_enabled:
@@ -682,12 +847,14 @@ def main():
         "║                 ┼──► acp 🌉 ──┼──► 🤖 Qwen / OpenCode       ║\n"
         "║   🌐 Web UI ──┘              └──► 🏭 Harness / ...          ║\n"
         "║                                                              ║\n"
-       f"║          v{_VERSION}  http://{host}:{port}                    ║\n"
+        f"║          v{_VERSION}  http://{host}:{port}                    ║\n"
         "╚══════════════════════════════════════════════════════════════╝\n"
     )
 
     # Safety net
-    import atexit, signal as _sig
+    import atexit
+    import signal as _sig
+
     def _kill_all():
         if pool:
             for (a, s), conn in list(pool._connections.items()):
@@ -695,10 +862,17 @@ def main():
                     os.killpg(conn.proc.pid, _sig.SIGKILL)
                 except (ProcessLookupError, PermissionError, OSError):
                     pass
+
     atexit.register(_kill_all)
 
-    uvicorn.run(app, host=host, port=port, log_level="debug" if args.verbose else "info",
-                timeout_graceful_shutdown=shutdown_timeout, loop="asyncio")
+    uvicorn.run(
+        app,
+        host=host,
+        port=port,
+        log_level="debug" if args.verbose else "info",
+        timeout_graceful_shutdown=shutdown_timeout,
+        loop="asyncio",
+    )
 
 
 if __name__ == "__main__":

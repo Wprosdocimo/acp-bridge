@@ -5,12 +5,18 @@ import asyncio
 from datetime import timedelta
 
 import pytest
-
 from acp_sdk.server.store.store import StoreModel
 
-from src.acp_patch import PerKeyEventMemoryStore, apply_executor_patch
+from src.acp_patch import (
+    PerKeyEventMemoryStore,
+    _apply_uvicorn_loop_shim,
+    apply_executor_patch,
+)
 from src.circuit_breaker import (
-    CircuitBreaker, CircuitBreakerConfig, CircuitBreakerOpenError, CircuitState,
+    CircuitBreaker,
+    CircuitBreakerConfig,
+    CircuitBreakerOpenError,
+    CircuitState,
 )
 
 
@@ -25,6 +31,7 @@ def make_store():
 # ---------------------------------------------------------------------------
 # PerKeyEventMemoryStore
 # ---------------------------------------------------------------------------
+
 
 @pytest.mark.asyncio
 async def test_unrelated_write_does_not_wake_watcher():
@@ -111,6 +118,7 @@ async def test_key_event_garbage_collected_after_watcher_exits():
     await asyncio.wait_for(t, timeout=2)
     del t
     import gc
+
     # async generator finalization is scheduled on the loop; give it a tick
     for _ in range(5):
         gc.collect()
@@ -124,9 +132,11 @@ async def test_key_event_garbage_collected_after_watcher_exits():
 # Executor cancellation-watcher reaping
 # ---------------------------------------------------------------------------
 
+
 @pytest.mark.asyncio
 async def test_executor_patch_reaps_watcher_on_run_completion():
     from acp_sdk.server.executor import Executor
+
     apply_executor_patch()
 
     store = make_store()
@@ -148,6 +158,7 @@ async def test_executor_patch_reaps_watcher_on_run_completion():
 
 def test_executor_patch_is_idempotent():
     from acp_sdk.server.executor import Executor
+
     apply_executor_patch()
     first = Executor.execute
     apply_executor_patch()
@@ -155,13 +166,55 @@ def test_executor_patch_is_idempotent():
 
 
 # ---------------------------------------------------------------------------
+# uvicorn.config.LoopSetupType compat shim (issue #21)
+# ---------------------------------------------------------------------------
+
+
+def test_uvicorn_loop_shim_makes_server_run_hints_resolvable():
+    """acp-sdk 1.0.3 annotates Server.run's `loop` as uvicorn.config.LoopSetupType,
+    renamed to LoopFactoryType in uvicorn 0.36. The shim (applied at acp_patch
+    import time) must let get_type_hints(Server.run) resolve without AttributeError."""
+    import typing
+
+    import acp_sdk.server as acp_server
+
+    # Importing src.acp_patch (done at module load) has already run the shim.
+    hints = typing.get_type_hints(acp_server.Server.run)
+    # `loop` resolves to the Literal that LoopFactoryType/LoopSetupType both name.
+    assert "loop" in hints
+
+
+def test_uvicorn_loop_shim_aliases_or_noops():
+    """On uvicorn >= 0.36 the shim aliases LoopSetupType -> LoopFactoryType;
+    on older uvicorn LoopSetupType already exists so it's a no-op. Either way
+    the name is present and equal to LoopFactoryType when that exists."""
+    import uvicorn.config as uc
+
+    _apply_uvicorn_loop_shim()  # idempotent
+    assert hasattr(uc, "LoopSetupType")
+    if hasattr(uc, "LoopFactoryType"):
+        assert uc.LoopSetupType is uc.LoopFactoryType
+
+
+def test_uvicorn_loop_shim_is_idempotent():
+    import uvicorn.config as uc
+
+    _apply_uvicorn_loop_shim()
+    first = uc.LoopSetupType
+    _apply_uvicorn_loop_shim()
+    assert uc.LoopSetupType is first
+
+
+# ---------------------------------------------------------------------------
 # Streaming circuit-breaker gate (before_call/on_success/on_failure)
 # ---------------------------------------------------------------------------
 
+
 @pytest.mark.asyncio
 async def test_manual_gate_success_and_failure_accounting():
-    cb = CircuitBreaker("t", CircuitBreakerConfig(
-        failure_threshold=2, expected_exceptions=(ValueError,)))
+    cb = CircuitBreaker(
+        "t", CircuitBreakerConfig(failure_threshold=2, expected_exceptions=(ValueError,))
+    )
 
     async def gen(fail):
         yield "a"
@@ -197,8 +250,9 @@ async def test_manual_gate_success_and_failure_accounting():
 async def test_call_still_works_via_public_gate():
     """CircuitBreaker.call refactored onto before_call/on_success/on_failure —
     behavior must be unchanged."""
-    cb = CircuitBreaker("t", CircuitBreakerConfig(
-        failure_threshold=1, expected_exceptions=(ValueError,)))
+    cb = CircuitBreaker(
+        "t", CircuitBreakerConfig(failure_threshold=1, expected_exceptions=(ValueError,))
+    )
 
     async def ok():
         return 42

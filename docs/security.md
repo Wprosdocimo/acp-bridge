@@ -12,7 +12,7 @@ Agents run as full subprocesses of the Bridge host, with the Bridge user's permi
 
 - **Token compromise ≈ shell compromise.** Anyone with `ACP_TOKEN` can tell an agent to `rm -rf`, exfiltrate `~/.ssh`, or hit internal services. Rotate tokens, never commit them, and scope `allowed_ips` tightly.
 - **`--trust-all-tools`** auto-approves every tool call. Kiro's default config includes this flag — remove it in untrusted networks.
-- **`session/request_permission`** is auto-answered with `proceed_always` so Claude doesn't hang. Same implication: anything the agent wants to do, it gets to do.
+- **`session/request_permission`** is auto-answered with `proceed_always` so Claude doesn't hang. Same implication: anything the agent wants to do, it gets to do. Filesystem access is bounded by the [Filesystem Sandbox](#filesystem-sandbox-v0460) (below); shell/network access is not.
 - **Prompt injection is a real vector.** Untrusted content fed to an agent (web pages, user input, log files) can hijack it into running unintended commands.
 
 ## Authentication
@@ -31,6 +31,55 @@ The same fail-closed rule applies to `mesh.token`: `/a2a` and `/a2a/announce` ar
 Verbose Bridge logging suppresses credential-bearing AWS SDK internals so temporary IAM session headers are not written to the service journal.
 
 File and Pipeline artifact downloads require the normal Bearer token. The LiteLLM usage callback does not require the Bridge token, but accepts requests only from loopback clients (`127.0.0.0/8` or `::1`).
+
+## Filesystem Sandbox (v0.46.0)
+
+Agents talk to the Bridge over ACP stdio JSON-RPC and can issue `fs/read_text_file` / `fs/write_text_file` requests with an arbitrary path. The client-supplied `cwd` (via `/runs` metadata and pipeline `shared_cwd`) is also attacker-controllable. Without bounds, any agent — or a prompt-injected one — could read host secrets (`.env`, `~/.aws/credentials`) or write anywhere.
+
+The sandbox maps each agent to a **trust level** via its `trust` config field:
+
+| Level | Name | Filesystem access | On violation |
+|-------|------|-------------------|--------------|
+| 0 (default) | `sandboxed` | Only within an allowed root: the agent's `working_dir`, `public_workdir`, the pipeline workspace base, `upload_dir`, plus any `sandbox.allowed_roots` | Denied |
+| 1 | `workspace` | Anything **except** the security-sensitive blacklist (`~/.aws`, `~/.ssh`, `/etc`, `**/.env`, `**/*.pem`, …) | Denied if blacklisted |
+| 2 | `unrestricted` | Any path | Allowed; **startup warning** + every op audited |
+
+Two admission checks, both resolving `realpath` first so `../` traversal and symlink escape are caught, and matching on path components (so `/tmp/acp` does not falsely contain `/tmp/acp-public`):
+
+1. **cwd admission** — a client-supplied `cwd`/`shared_cwd` must itself be legal for the agent's level, so `cwd=/` cannot bypass level-0 bounds. An empty `cwd` falls back to the config `working_dir`.
+2. **fs admission** — each read/write path is checked against the level. The connection's own `cwd` is an implicit allowed root at level 0, so legitimate pipeline `shared_cwd` work is never blocked.
+
+Configure per agent in `config.yaml` (unset = level 0):
+
+```yaml
+agents:
+  kiro:
+    working_dir: "/home/me/projects/acp-bridge"
+    trust: "workspace"   # level 1 — free access except the blacklist
+
+sandbox:
+  enabled: true
+  allowed_roots: []      # extra level-0 roots beyond working_dir + shared dirs
+  # blacklist: [...]     # omit to use the built-in default (src/sandbox.py)
+```
+
+> **Level 2 is never the default and must be set explicitly.** When any agent is `unrestricted`, the Bridge logs a `SECURITY:` warning at startup.
+
+### fs Audit
+
+Every fs read/write and every rejected `cwd` is recorded in the `fs_audit` SQLite table (co-located in `data/jobs.db`, best-effort, never blocks the agent). Each row captures `ts, agent, trust_level, session_id, operation, path, cwd, size, outcome, deny_reason`. Query it:
+
+```bash
+# All denied fs attempts in the last hour
+curl -s "http://localhost:18010/admin/fs-audit?outcome=denied" \
+  -H "Authorization: Bearer $ACP_BRIDGE_TOKEN"
+
+# Everything a specific agent touched
+curl -s "http://localhost:18010/admin/fs-audit?agent=kiro&limit=200" \
+  -H "Authorization: Bearer $ACP_BRIDGE_TOKEN"
+```
+
+Filters: `agent`, `trust_level` (0/1/2), `outcome` (`allowed`/`denied`), `since` (unix ts), `limit`. Records are pruned by the same retention loop as `prompt_log`.
 
 ## Deployment Recommendations
 

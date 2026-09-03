@@ -1,12 +1,13 @@
 """Admin endpoints for the prompt_log table — cross-link querying and direct lookup."""
 
-from fastapi import Path as PathParam, Query
+from fastapi import Path as PathParam
+from fastapi import Query
 from fastapi.responses import JSONResponse
 
 from ..prompt_log import PromptStore, row_to_summary
 
 
-def register(app, prompt_store: PromptStore | None = None):
+def register(app, prompt_store: PromptStore | None = None, fs_audit=None):
 
     @app.get("/admin/prompts")
     async def list_prompts(
@@ -42,3 +43,30 @@ def register(app, prompt_store: PromptStore | None = None):
             return JSONResponse({"error": "record not found"}, status_code=404)
         include_final = "final" in {x.strip() for x in (include or "").split(",")}
         return row_to_summary(row, include_final)
+
+    @app.get("/admin/fs-audit")
+    async def list_fs_audit(
+        agent: str = Query("", description="filter by agent name"),
+        trust_level: int = Query(-1, description="filter: 0=sandboxed 1=workspace 2=unrestricted"),
+        outcome: str = Query("", description="filter: 'allowed' | 'denied'"),
+        since: float = Query(0, description="unix ts lower bound (0 = no bound)"),
+        limit: int = Query(100, ge=1, le=1000),
+    ):
+        """Query the agent filesystem-access audit trail.
+
+        Records who (agent + trust level), when (ts), what (read/write/cwd),
+        which path, and the allow/deny outcome + reason.
+        """
+        if not fs_audit:
+            return JSONResponse({"error": "fs audit disabled"}, status_code=503)
+        rows = fs_audit.search(
+            agent=agent or None,
+            trust_level=trust_level if trust_level >= 0 else None,
+            outcome=outcome or None,
+            since=since or None,
+            limit=limit,
+        )
+        level_names = {0: "sandboxed", 1: "workspace", 2: "unrestricted"}
+        for r in rows:
+            r["trust_name"] = level_names.get(r.get("trust_level", 0), "?")
+        return {"count": len(rows), "records": rows}

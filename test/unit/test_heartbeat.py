@@ -1,9 +1,11 @@
 """Unit tests for src/heartbeat.py — v0.23.1 diagnostic fidelity + fast-fail probe."""
 
-import os, sys
+import os
+import sys
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from src.heartbeat import EnvCollector, HEARTBEAT_IDLE_TIMEOUT
+from src.heartbeat import HEARTBEAT_IDLE_TIMEOUT, EnvCollector
 
 
 def _collector():
@@ -27,7 +29,7 @@ def test_record_keeps_real_response_when_silent():
 
 def test_record_distinguishes_empty_from_silent():
     c = _collector()
-    c.record("kiro", "prompt", "", silent=True, duration=300.0)   # timeout: empty
+    c.record("kiro", "prompt", "", silent=True, duration=300.0)  # timeout: empty
     c.record("kiro", "prompt", "[SILENT]", silent=True, duration=3.0)  # real reply
     empty, real = c._history[-2], c._history[-1]
     # Both silent, but response content tells them apart.

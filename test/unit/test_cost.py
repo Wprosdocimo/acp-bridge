@@ -7,19 +7,24 @@ v0.23.0:
   - 新增 lookup_pricing 测试.
 """
 
-import os, sys
+import os
+import sys
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from src.cost import (
-    estimate_tokens, calc_cost, calc_cost_v2,
-    model_from_agent, lookup_pricing,
     BEDROCK_PRICING,
+    calc_cost,
+    calc_cost_v2,
+    estimate_tokens,
+    lookup_pricing,
+    model_from_agent,
 )
-
 
 # ============================================================================
 # Legacy estimate_tokens
 # ============================================================================
+
 
 def test_estimate_tokens_empty():
     assert estimate_tokens("") == 0
@@ -50,6 +55,7 @@ def test_estimate_tokens_cjk_mixed():
 # ============================================================================
 # Pricing table sanity
 # ============================================================================
+
 
 def test_pricing_table_has_all_required_fields():
     for model, p in BEDROCK_PRICING.items():
@@ -97,6 +103,7 @@ def test_non_anthropic_no_cache_pricing():
 # lookup_pricing
 # ============================================================================
 
+
 def test_lookup_pricing_direct_hit():
     p, k = lookup_pricing("us.anthropic.claude-sonnet-4-6")
     assert k == "us.anthropic.claude-sonnet-4-6"
@@ -131,6 +138,7 @@ def test_lookup_pricing_empty_or_none():
 # calc_cost_v2 (新 4-token-class API)
 # ============================================================================
 
+
 def test_calc_cost_v2_claude_with_cache():
     # 1M input (含 800K cache_read + 100K cache_create + 100K real input) + 50K output
     cost = calc_cost_v2(
@@ -142,10 +150,10 @@ def test_calc_cost_v2_claude_with_cache():
     )
     p = BEDROCK_PRICING["us.anthropic.claude-sonnet-4-6"]
     expected = (
-        100_000 * p["input"]            # 100K real input × $3.30/M = $0.33
-        + 800_000 * p["cache_read"]     # 800K cache read × $0.33/M = $0.264
-        + 100_000 * p["cache_create"]   # 100K cache write × $4.125/M = $0.4125
-        + 50_000 * p["output"]          # 50K output × $16.50/M = $0.825
+        100_000 * p["input"]  # 100K real input × $3.30/M = $0.33
+        + 800_000 * p["cache_read"]  # 800K cache read × $0.33/M = $0.264
+        + 100_000 * p["cache_create"]  # 100K cache write × $4.125/M = $0.4125
+        + 50_000 * p["output"]  # 50K output × $16.50/M = $0.825
     )
     # = $1.83
     assert abs(cost - expected) < 1e-10
@@ -224,6 +232,7 @@ def test_calc_cost_v2_cached_exceeds_input_clamps_to_zero():
 # Legacy calc_cost (向后兼容, jobs.py 仍用)
 # ============================================================================
 
+
 def test_calc_cost_legacy_claude():
     # 旧 API 不传 cache, 按 input/output 算
     cost = calc_cost(1000, 500, "us.anthropic.claude-sonnet-4-6")
@@ -245,6 +254,7 @@ def test_calc_cost_legacy_zero():
 # ============================================================================
 # model_from_agent (legacy, jobs.py 用)
 # ============================================================================
+
 
 def test_model_from_agent_returns_lookupable_keys():
     """v0.23.0: 返回的 key 必须能被 lookup_pricing 命中."""
@@ -276,4 +286,4 @@ if __name__ == "__main__":
         if name.startswith("test_") and callable(fn):
             fn()
             print(f"✅ {name}")
-    print(f"\n=== All cost tests passed ✅ ===")
+    print("\n=== All cost tests passed ✅ ===")
