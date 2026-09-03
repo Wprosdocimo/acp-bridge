@@ -16,10 +16,18 @@ dependencies = [
 version = {file = "VERSION"}
 
 [tool.uv]
-# acp-sdk 1.0.3 (only published version as of 2026-08) doesn't pin a compatible
-# uvicorn range; uvicorn>=0.36 renamed config.LoopSetupType -> LoopFactoryType,
-# breaking acp_sdk.server.server's import. Pin below the rename until acp-sdk
-# fixes its own constraint upstream.
+# acp-sdk 1.0.3's Server.run annotates loop as uvicorn.config.LoopSetupType
+# (renamed to LoopFactoryType in uvicorn 0.36). Upstream's own shim
+# (src/acp_patch.py::_apply_uvicorn_loop_shim, added in v0.45.3) only works
+# because PEP 649 defers annotation evaluation on Python 3.14 — on our
+# pinned 3.12 (see .python-version; needed for an unrelated pydantic/3.14
+# bug), `class Server: loop: uvicorn.config.LoopSetupType = "auto"` evaluates
+# the annotation immediately at class-body time, which is also before
+# acp_patch even runs (main.py imports acp_sdk.server at module load,
+# acp_patch is only imported lazily inside a function much later). Confirmed
+# by testing: removing this pin passes on paper but fails 2 test files at
+# collection with AttributeError on uvicorn 0.52.4. Re-evaluate if this repo
+# ever moves off Python 3.12, or if upstream restructures the import order.
 override-dependencies = ["uvicorn<0.36"]
 
 [dependency-groups]
