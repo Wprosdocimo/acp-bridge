@@ -27,25 +27,71 @@ MSBUILD='C:\Program Files\Microsoft Visual Studio\2022\Community\MSBuild\Current
 VSTEST='C:\Program Files\Microsoft Visual Studio\2022\Community\Common7\IDE\CommonExtensions\Microsoft\TestWindow\vstest.console.exe'
 TEST_DLL='E:\ci\EEmovel-Backend\EEmovel.Unit.Tests\bin\Debug\net481\EEmovel.Unit.Tests.dll'
 
-# Only variable input accepted: an optional vstest /TestCaseFilter value.
-# Never shell-interpolated into anything *this script* executes directly -
-# but it does end up as literal text inside a .bat that cmd.exe parses, and
-# cmd.exe treats &, |, >, <, ^, %, " as special even inside a quoted argument
-# in several contexts. vstest's own filter syntax legitimately overlaps with
-# some of those (e.g. Category!=Slow), so this is a real injection surface,
-# not a theoretical one - allowlist to a conservative safe subset (name/value
-# matching via ~ and =) rather than trying to get cmd.exe quoting exactly
-# right. Reject loudly instead of silently stripping.
-TEST_FILTER="${1:-}"
-if [ -n "$TEST_FILTER" ] && ! [[ "$TEST_FILTER" =~ ^[A-Za-z0-9_.~=]+$ ]]; then
-    echo "[error] test filter contains disallowed characters (only letters, digits, . _ ~ = are accepted): $TEST_FILTER"
-    exit 4
-fi
+# Only variable input accepted: whitespace-separated key=value tokens, only
+# "branch=" and "filter=" recognized (2026-09-04: added branch= — an
+# orchestrator asking "run the legacy tests on branch X" needs a way to pick
+# the branch, previously this always ran whatever the CI clone happened to
+# have checked out). Never shell-interpolated into anything *this script*
+# executes directly - but the filter value does end up as literal text
+# inside a .bat that cmd.exe parses, and cmd.exe treats &, |, >, <, ^, %, "
+# as special even inside a quoted argument in several contexts. vstest's own
+# filter syntax legitimately overlaps with some of those (e.g.
+# Category!=Slow), so this is a real injection surface, not a theoretical
+# one - allowlist each field to a conservative safe subset rather than
+# trying to get cmd.exe quoting exactly right. Reject loudly (unknown key,
+# or a recognized key with a disallowed character) instead of silently
+# stripping or ignoring.
+BRANCH=""
+TEST_FILTER=""
+for token in "${1:-}"; do
+    [ -z "$token" ] && continue
+    for kv in $token; do
+        case "$kv" in
+            branch=*)
+                BRANCH="${kv#branch=}"
+                if ! [[ "$BRANCH" =~ ^[A-Za-z0-9._/-]+$ ]]; then
+                    echo "[error] branch contains disallowed characters (only letters, digits, . _ / - are accepted): $BRANCH"
+                    exit 4
+                fi
+                ;;
+            filter=*)
+                TEST_FILTER="${kv#filter=}"
+                if ! [[ "$TEST_FILTER" =~ ^[A-Za-z0-9_.~=]+$ ]]; then
+                    echo "[error] test filter contains disallowed characters (only letters, digits, . _ ~ = are accepted): $TEST_FILTER"
+                    exit 4
+                fi
+                ;;
+            *)
+                echo "[error] unrecognized token (expected branch=... and/or filter=...): $kv"
+                exit 4
+                ;;
+        esac
+    done
+done
 
 if [ ! -d "$CI_DIR_WSL" ]; then
     echo "[error] CI clone not found at $CI_DIR_WSL - run the one-time setup"
     echo "        documented in ai-memory procedural/eemovel-backend-build-test-windows-interop.md"
     exit 2
+fi
+
+if [ -n "$BRANCH" ]; then
+    echo "[run-eemovel-tests] checking out branch: $BRANCH"
+    # EEmovel.Web.Api/Web.config is .gitignore'd but was committed before
+    # that rule existed, so git still tracks local edits to it - it holds a
+    # fixed, machine-specific local override (never meant to match any
+    # branch's committed version, see ai-memory procedural doc), and a plain
+    # `reset --hard` would silently blow it away on every branch switch.
+    # Preserve it across the checkout instead of relying on git to leave it
+    # alone.
+    WEBCONFIG="$CI_DIR_WSL/EEmovel.Web.Api/Web.config"
+    WEBCONFIG_BACKUP="$(mktemp)"
+    cp "$WEBCONFIG" "$WEBCONFIG_BACKUP"
+    git -C "$CI_DIR_WSL" fetch --quiet origin "$BRANCH"
+    git -C "$CI_DIR_WSL" checkout --quiet "$BRANCH"
+    git -C "$CI_DIR_WSL" reset --quiet --hard "origin/$BRANCH"
+    cp "$WEBCONFIG_BACKUP" "$WEBCONFIG"
+    rm -f "$WEBCONFIG_BACKUP"
 fi
 
 BUILD_BAT="$CI_DIR_WSL/_eemovel_build.bat"
