@@ -91,7 +91,15 @@ deny_path_exceptions = [
     "**/.git/**",
 ]
 
-no_docker = true
+# no_docker removed 2026-09-03: it was overriding acp-bridge-testrunner.service's
+# explicit --docker CLI flag (project .ai-jail config wins over a CLI flag —
+# confirmed live: `ai-jail --docker --dry-run` from this repo still produced
+# --no-docker in the final bwrap args with this line present). ai-jail's own
+# built-in default is already docker-off, so removing this line changes
+# nothing for acp-bridge.service (no --docker in its ExecStart, stays off);
+# only acp-bridge-testrunner.service, which passes --docker explicitly, is
+# affected — see that unit's own comments for why (Testcontainers-dotnet's
+# log-streaming wait strategies hang against Podman's REST API).
 no_gpu = true
 no_display = true
 
