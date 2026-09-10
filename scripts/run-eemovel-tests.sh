@@ -88,7 +88,11 @@ if [ -n "$BRANCH" ]; then
     WEBCONFIG_BACKUP="$(mktemp)"
     cp "$WEBCONFIG" "$WEBCONFIG_BACKUP"
     git -C "$CI_DIR_WSL" fetch --quiet origin "$BRANCH"
-    git -C "$CI_DIR_WSL" checkout --quiet "$BRANCH"
+    # -f: a prior manual build in this same clone (see ai-memory doc) always
+    # leaves Web.config locally modified as a harmless side effect, and a
+    # plain checkout refuses to switch over that. Discarding it here is safe
+    # because it's restored from the backup right below regardless of branch.
+    git -C "$CI_DIR_WSL" checkout --quiet -f "$BRANCH"
     git -C "$CI_DIR_WSL" reset --quiet --hard "origin/$BRANCH"
     cp "$WEBCONFIG_BACKUP" "$WEBCONFIG"
     rm -f "$WEBCONFIG_BACKUP"
@@ -118,11 +122,16 @@ echo EXITCODE=%ERRORLEVEL% >> _eemovel_test.log
 EOF
 
 echo "[run-eemovel-tests] building (E:\\ci\\EEmovel-Backend)..."
+BUILD_LOG="$CI_DIR_WSL/_eemovel_build.log"
+# A silently-failed cmd.exe /c leaves the PREVIOUS run's log sitting there,
+# and `[ ! -f ]` alone can't tell a stale log from a fresh one - it read a
+# 2-day-old log as this run's result on 2026-09-08 (and again 2026-09-10).
+# Removing it first turns a silent interop failure into a real "no log" error.
+rm -f "$BUILD_LOG"
 # cmd.exe /c's own stdout is just the ignorable WSL-UNC-cwd warning - the
 # real result always lives in the .log file on disk, never trust this stdout.
 cmd.exe /c "${CI_DIR_WIN}\\_eemovel_build.bat" >/dev/null 2>&1 || true
 
-BUILD_LOG="$CI_DIR_WSL/_eemovel_build.log"
 if [ ! -f "$BUILD_LOG" ]; then
     echo "[error] build did not produce a log file - interop likely failed"
     exit 3
@@ -137,9 +146,10 @@ if ! tr -d '\r' < "$BUILD_LOG" | grep -qE "^EXITCODE=0[[:space:]]*$"; then
 fi
 
 echo "[run-eemovel-tests] running tests..."
+TEST_LOG="$CI_DIR_WSL/_eemovel_test.log"
+rm -f "$TEST_LOG"  # same stale-log risk as the build log above
 cmd.exe /c "${CI_DIR_WIN}\\_eemovel_test.bat" >/dev/null 2>&1 || true
 
-TEST_LOG="$CI_DIR_WSL/_eemovel_test.log"
 if [ ! -f "$TEST_LOG" ]; then
     echo "[error] test run did not produce a log file - interop likely failed"
     exit 3
