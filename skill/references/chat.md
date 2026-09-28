@@ -4,7 +4,7 @@
 
 `/chat ko` or `/chat cc [--cwd <path>]`
 
-1. Generate deterministic session_id (UUID v5, based on agent name)
+1. Generate a new random session_id (UUID v4) for this chat
 2. Write `chat-state.json`:
    ```json
    {
@@ -38,6 +38,8 @@ Run `/chat cc` directly to replace state; old session preserved on server.
 
 ## Session ID
 
-- Auto-generated deterministic UUID per agent name — same agent always reuses same session
-- Different agents use different session_ids
+- Each chat gets its own random UUID, kept in `chat-state.json`, so two chats
+  on the same agent never share a process
+- Without `-s`, the bridge derives the session from (agent, cwd): calls from the
+  same directory reuse one session, calls from different directories do not
 - Manual override: `$ACP_CLIENT -s <uuid> "<prompt>"`

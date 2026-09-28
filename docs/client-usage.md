@@ -6,7 +6,7 @@
 
 ## acp-client.sh
 
-Bash client for ACP Bridge. Requires `curl`, `jq`, `uuidgen`.
+Bash client for ACP Bridge. Requires `curl`, `jq`.
 
 ### Setup
 

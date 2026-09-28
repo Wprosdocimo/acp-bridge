@@ -33,7 +33,7 @@ ACP Bridge is a local HTTP gateway that turns CLI agents (Kiro, Claude Code, Cod
   npm i -g @openai/codex                                   # Codex
   ```
   → Full list with install commands: [Agents](agents.md)
-- Client dependencies: `curl`, `jq`, `uuidgen`
+- Client dependencies: `curl`, `jq`
 - For Codex with non-OpenAI models: [Node.js](https://nodejs.org/), [LiteLLM](https://github.com/BerriAI/litellm) — see [Configuration](configuration.md#codex--litellm-setup)
 
 ## Install
