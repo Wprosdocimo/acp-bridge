@@ -278,7 +278,9 @@ def main():
                 agent_profile.setdefault("litellm_api_key", litellm_key)
             handler = make_acp_agent_handler(name, pool, profile=agent_profile)
         else:
-            handler = make_pty_agent_handler(cfg, verbose=args.verbose)
+            handler = make_pty_agent_handler(
+                cfg, verbose=args.verbose, sandbox=sandbox, agent_name=name
+            )
         # Build metadata, marking this agent as locally served (symmetric with mesh
         # remote agents, which get "mesh"/"node:<name>" tags in mesh_client.reconcile()).
         # Metadata must be set at construction (Agent.metadata is read-only afterwards).

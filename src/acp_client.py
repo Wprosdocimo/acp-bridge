@@ -581,14 +581,14 @@ class AcpProcessPool:
         log.info("lru_reuse: agent=%s session=%s→%s", new_agent, old_key[1], new_session_id)
         conn.session_id = new_session_id
         conn.session_reset = True
+        new_cwd = cwd or self._config[new_agent].get("working_dir", "/tmp")
         try:
-            await conn.session_new(
-                cwd or self._config[new_agent].get("working_dir", "/tmp"), profile=profile
-            )
+            await conn.session_new(new_cwd, profile=profile)
         except Exception:
             await conn.kill()
             self._save_pids()
             raise
+        conn.cwd = new_cwd
         self._connections[new_key] = conn
         self._save_pids()
         return conn
@@ -660,7 +660,30 @@ class AcpProcessPool:
         conn = self._connections.get(key)
 
         if conn and conn.alive:
-            return conn
+            # A live connection can only serve the directory it was created
+            # with: the process was spawned with that OS cwd and the ACP
+            # session was bound to it at session/new. Handing it back for a
+            # different cwd ran the agent in the old directory while the caller
+            # believed otherwise (kiro auditing /tmp instead of the repo it was
+            # given, 2026-09-14), so retire it and respawn below instead.
+            if not cwd or conn.cwd == cwd:
+                return conn
+            if conn._busy:
+                raise AcpError(
+                    f"session {session_id} is busy in {conn.cwd or '(default)'}; "
+                    f"cannot rebind to {cwd}"
+                )
+            log.info(
+                "cwd_rebind: agent=%s session=%s %s -> %s, respawning",
+                agent,
+                session_id,
+                conn.cwd or "(default)",
+                cwd,
+            )
+            self._connections.pop(key, None)
+            await conn.kill()
+            self._save_pids()
+            conn = None
 
         # Resolve profile: explicit param > agent config
         if profile is None:

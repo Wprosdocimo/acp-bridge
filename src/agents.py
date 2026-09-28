@@ -351,6 +351,12 @@ def make_acp_agent_handler(agent_name: str, pool: AcpProcessPool, profile: dict 
         if context.request:
             if not cwd:
                 cwd = context.request.headers.get("x-acp-cwd", "")
+            if not explicit_session:
+                # Same reason as cwd: an external caller cannot put session_id in
+                # part metadata (the SDK's discriminated union rejects it), so
+                # without this header every /runs caller collapsed onto the one
+                # session derived per agent below - and inherited its cwd.
+                explicit_session = context.request.headers.get("x-acp-session", "")
             if not resume_session_id:
                 resume_session_id = context.request.headers.get("x-acp-resume-session", "")
             # Also check query params (convenient for curl)
@@ -658,7 +664,7 @@ def make_lambda_agent_handler(
     return handler
 
 
-def make_pty_agent_handler(agent_cfg: dict, verbose: bool = False):
+def make_pty_agent_handler(agent_cfg: dict, verbose: bool = False, sandbox=None, agent_name: str = ""):
     """Legacy PTY handler — subprocess stdout line-by-line."""
     command = agent_cfg["command"]
     args = agent_cfg.get("args", [])
@@ -679,7 +685,34 @@ def make_pty_agent_handler(agent_cfg: dict, verbose: bool = False):
         env.update(agent_cfg.get("env", {}))
 
         cmd = [command] + list(args) + [prompt]
-        pty_cwd = agent_cfg.get("working_dir", "/tmp")
+        # O cwd do chamador chega por metadata da part ou, para callers externos de
+        # /runs, pelo header x-acp-cwd — mesma razao do handler ACP (o SDK descarta
+        # campos de topo). Sem isto o agente pty ficava preso no working_dir do
+        # config: cursor respondendo de /tmp enquanto o chamador acreditava estar no
+        # repo, embora o MESMO agente via acp_submit_job ja honrasse o cwd
+        # (src/jobs.py _run_pty). Aqui so o caminho sincrono estava de fora.
+        req_cwd, _, _, _ = _extract_metadata(input)
+        if not req_cwd and context.request:
+            req_cwd = context.request.headers.get("x-acp-cwd", "")
+        # Admissao no sandbox, igual ao caminho ACP (AcpProcessPool.get_or_create):
+        # cwd vindo do chamador e controlavel externamente, entao precisa ser um
+        # local legal para o trust level deste agente — senao cwd=/ furaria os
+        # limites de fs do nivel 0.
+        if req_cwd and sandbox is not None:
+            from src.sandbox import normalize_level
+
+            level = normalize_level(agent_cfg.get("trust"))
+            ok, reason = sandbox.check_cwd(level, req_cwd)
+            if not ok:
+                log.warning(
+                    "pty_cwd_denied: agent=%s level=%d cwd=%s reason=%s",
+                    agent_name or command,
+                    level,
+                    req_cwd,
+                    reason,
+                )
+                raise PermissionError(f"sandbox denied cwd ({reason}): {req_cwd}")
+        pty_cwd = req_cwd or agent_cfg.get("working_dir", "/tmp")
         os.makedirs(pty_cwd, exist_ok=True)
 
         proc = await asyncio.create_subprocess_exec(
