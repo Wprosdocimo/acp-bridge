@@ -148,8 +148,9 @@ PAYLOAD=$(jq -n \
     --arg prompt "$PROMPT" \
     --arg mode "$MODE" \
     --arg cwd "$CWD" \
-    '{agent_name: $agent, session_id: $session,
+    '{agent_name: $agent,
       input: [{parts: [{content: $prompt, content_type: "text/plain"}]}]}
+      + (if $session != "" then {session_id: $session} else {} end)
       + (if $cwd != "" then {cwd: $cwd} else {} end)
       + (if $mode == "stream" then {mode: "stream"} else {} end)')
 
@@ -227,8 +228,9 @@ _rebuild_payload() {
         --arg prompt "$PROMPT" \
         --arg mode "$MODE" \
         --arg cwd "$CWD" \
-        '{agent_name: $agent, session_id: $session,
+        '{agent_name: $agent,
           input: [{parts: [{content: $prompt, content_type: "text/plain"}]}]}
+          + (if $session != "" then {session_id: $session} else {} end)
           + (if $cwd != "" then {cwd: $cwd} else {} end)
           + (if $mode == "stream" then {mode: "stream"} else {} end)')
 }
