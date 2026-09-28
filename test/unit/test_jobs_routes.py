@@ -10,6 +10,7 @@ import asyncio
 import os
 import sys
 import tempfile
+import uuid
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
@@ -130,3 +131,23 @@ async def test_post_jobs_allowed_private_targets_never_cover_metadata():
         )
     assert resp.status_code == 400
     assert job_mgr._jobs == {}
+
+
+async def _submit(client, **fields):
+    resp = await client.post("/jobs", json={"agent_name": "kiro", "prompt": "hi", **fields})
+    assert resp.status_code == 200
+    return resp.json()["session_id"]
+
+
+@pytest.mark.asyncio
+async def test_post_jobs_default_session_is_scoped_by_cwd():
+    app, _job_mgr = _app()
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        a = await _submit(client, cwd="/repos/worktree-a")
+        b = await _submit(client, cwd="/repos/worktree-b")
+        no_cwd = await _submit(client)
+        explicit = await _submit(client, cwd="/repos/worktree-a", session_id="my-session")
+    assert a != b
+    assert no_cwd == str(uuid.uuid5(uuid.NAMESPACE_DNS, "kiro"))
+    assert explicit == "my-session"

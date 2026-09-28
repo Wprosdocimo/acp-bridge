@@ -26,6 +26,7 @@ from .fallback_policy import (
 )
 from .formatters import fmt
 from .heartbeat import EnvCollector
+from .session_ids import default_session_id
 from .sse import transform_notification
 from .stats import StatsCollector
 from .trace_impl import get_trace, init_trace, start_span
@@ -360,13 +361,13 @@ def make_acp_agent_handler(agent_name: str, pool: AcpProcessPool, profile: dict 
         # Session reuse strategy:
         # 1. channel_id → per (agent, channel) — IM scenarios
         # 2. explicit session_id in metadata → caller override
-        # 3. fallback → one process per agent
+        # 3. fallback → one process per (agent, cwd); per agent when no cwd
         if channel_id:
             session_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{agent_name}:{channel_id}"))
         elif explicit_session:
             session_id = explicit_session
         else:
-            session_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, agent_name))
+            session_id = default_session_id(agent_name, cwd)
 
         # Initialize trace with session_id
         init_trace(session_id)

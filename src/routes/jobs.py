@@ -1,7 +1,5 @@
 """Job endpoints — submit, query, list."""
 
-import uuid as _uuid
-
 from fastapi import Path as PathParam
 from fastapi import Query
 from fastapi.responses import JSONResponse
@@ -10,6 +8,7 @@ from starlette.responses import Response
 
 from ..jobs import JobManager
 from ..prompt_log import PromptStore, row_to_summary
+from ..session_ids import default_session_id
 from ..url_safety import UnsafeUrlError
 
 
@@ -37,7 +36,7 @@ def register(
     async def submit_job(req: JobRequest):
         if not job_mgr:
             return JSONResponse({"error": "no pool configured"}, status_code=500)
-        sid = req.session_id or str(_uuid.uuid5(_uuid.NAMESPACE_DNS, req.agent_name))
+        sid = req.session_id or default_session_id(req.agent_name, req.cwd)
         meta = req.callback_meta
         effective_target = req.target or req.discord_target
         if effective_target:
