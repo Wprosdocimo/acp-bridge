@@ -160,7 +160,9 @@ class AcpConnection:
     async def _fs_read_reply(self, msg_id: int, path: str) -> None:
         allowed, reason = self._fs_check("read", path)
         if not allowed:
-            self._auto_reply(msg_id, {"content": f"ERROR: EACCES: sandbox denied ({reason}): {path}"})
+            self._auto_reply(
+                msg_id, {"content": f"ERROR: EACCES: sandbox denied ({reason}): {path}"}
+            )
             return
 
         def _read():

@@ -665,7 +665,9 @@ def make_lambda_agent_handler(
     return handler
 
 
-def make_pty_agent_handler(agent_cfg: dict, verbose: bool = False, sandbox=None, agent_name: str = ""):
+def make_pty_agent_handler(
+    agent_cfg: dict, verbose: bool = False, sandbox=None, agent_name: str = ""
+):
     """Legacy PTY handler — subprocess stdout line-by-line."""
     command = agent_cfg["command"]
     args = agent_cfg.get("args", [])
