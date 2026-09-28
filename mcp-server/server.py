@@ -73,8 +73,8 @@ async def list_tools() -> list[Tool]:
                         "type": "string",
                         "description": (
                             "Session ID for multi-turn conversation continuity. "
-                            "Omit to share the agent's default session; pass a distinct "
-                            "one per repo/task to keep a separate process and cwd."
+                            "Omit to use the bridge default, one session per (agent, cwd); "
+                            "pass a distinct one to separate tasks in the same cwd."
                         ),
                     },
                 },
