@@ -45,6 +45,15 @@ if [ -z "${VM_PASSWORD:-}" ]; then
     exit 2
 fi
 
+# One run at a time: every job shares the single clone on the VM (and the
+# seed bundle), so two concurrent jobs (pool max_per_agent allows 2) switched
+# branches or overwrote the bundle under each other. A second job waits here.
+exec 9>"$VM_DIR/.runner.lock"
+if ! flock -w 3600 9; then
+    echo "[error] timed out waiting for another eemovel-tests-vm run to finish"
+    exit 5
+fi
+
 ssh_run() {
     sshpass -p "$VM_PASSWORD" ssh -p "$VM_PORT" \
         -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile="$VM_KNOWN_HOSTS" -o ConnectTimeout=10 \
@@ -129,10 +138,16 @@ mark_used
 # remote .bat).
 BRANCH=""
 TEST_FILTER=""
+REFRESH=""
 for token in "${1:-}"; do
     [ -z "$token" ] && continue
     for kv in $token; do
         case "$kv" in
+            refresh=1)
+                # Re-ship the seed bundle before fetching, so commits/branches
+                # made in the host clone since the last seed reach the VM.
+                REFRESH=1
+                ;;
             branch=*)
                 BRANCH="${kv#branch=}"
                 if ! [[ "$BRANCH" =~ ^[A-Za-z0-9._/-]+$ ]]; then
@@ -148,7 +163,7 @@ for token in "${1:-}"; do
                 fi
                 ;;
             *)
-                echo "[error] unrecognized token (expected branch=... and/or filter=...): $kv"
+                echo "[error] unrecognized token (expected refresh=1, branch=... and/or filter=...): $kv"
                 exit 4
                 ;;
         esac
@@ -159,6 +174,16 @@ if ! ssh_run "if exist C:\\ci\\EEmovel-Backend (exit 0) else (exit 1)" ; then
     echo "[error] CI clone not found at $CI_DIR_WIN on the VM - run the one-time seed:"
     echo "        scripts/seed-windows-ci-clone.sh (git bundle + nuget restore)"
     exit 2
+fi
+
+if [ -n "$REFRESH" ]; then
+    echo "[run-eemovel-tests-vm] refreshing seed bundle from the host clone"
+    "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/seed-windows-ci-clone.sh" --refresh
+    mark_used
+    if [ -z "$BRANCH" ]; then
+        echo "[run-eemovel-tests-vm] refresh only (no branch=), skipping build/test"
+        exit 0
+    fi
 fi
 
 if [ -n "$BRANCH" ]; then
