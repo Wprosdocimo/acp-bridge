@@ -5,7 +5,7 @@ import time
 
 import pytest
 
-from src.acp_client import AcpProcessPool, PoolExhaustedError
+from src.acp_client import AcpError, AcpProcessPool, PoolExhaustedError
 
 
 def make_pool(timeout: float, agents: dict | None = None) -> AcpProcessPool:
@@ -115,3 +115,72 @@ async def test_other_errors_propagate_immediately(monkeypatch):
         await pool.get_or_create("a", "s1")
     assert calls["n"] == 1
     assert time.monotonic() - t0 < 0.5
+
+
+class FakeConn:
+    """Minimal stand-in for AcpConnection: only what the cwd check touches."""
+
+    def __init__(self, cwd: str = "", busy: bool = False):
+        self.cwd = cwd
+        self.alive = True
+        self._busy = busy
+        self.killed = False
+
+    async def kill(self):
+        self.killed = True
+        self.alive = False
+
+
+def make_cwd_pool(monkeypatch) -> AcpProcessPool:
+    pool = make_pool(timeout=0, agents={"a": {"command": "agent-a"}, "b": {"command": "agent-b"}})
+    monkeypatch.setattr(pool, "_save_pids", lambda: None)
+    return pool
+
+
+@pytest.mark.asyncio
+async def test_live_connection_reused_when_cwd_matches(monkeypatch):
+    """Same cwd (or none requested) → warm process is handed back untouched."""
+    pool = make_cwd_pool(monkeypatch)
+    conn = FakeConn(cwd="/repo")
+    pool._connections[("a", "s1")] = conn
+
+    assert await pool.get_or_create("a", "s1", cwd="/repo") is conn
+    assert await pool.get_or_create("a", "s1") is conn
+    assert not conn.killed
+
+
+@pytest.mark.asyncio
+async def test_different_cwd_respawns_in_requested_dir(monkeypatch):
+    """A live process bound to another dir is retired, not silently reused."""
+    pool = make_cwd_pool(monkeypatch)
+    old = FakeConn(cwd="/tmp")
+    pool._connections[("a", "s1")] = old
+    spawned = {}
+
+    async def fake_spawn(agent, session_id, cfg, **kwargs):
+        spawned["cwd"] = kwargs.get("cwd_override")
+        spawned["is_rebuild"] = kwargs.get("is_rebuild")
+        return FakeConn(cwd=kwargs.get("cwd_override", ""))
+
+    monkeypatch.setattr(pool, "_spawn", fake_spawn)
+
+    conn = await pool.get_or_create("a", "s1", cwd="/repo")
+    assert old.killed
+    assert conn is not old
+    assert conn.cwd == "/repo"
+    assert spawned["cwd"] == "/repo"
+    assert spawned["is_rebuild"] is False
+    assert pool._connections[("a", "s1")] is conn
+
+
+@pytest.mark.asyncio
+async def test_busy_connection_refuses_cwd_rebind(monkeypatch):
+    """Mid-flight process must not be killed under the running request."""
+    pool = make_cwd_pool(monkeypatch)
+    busy = FakeConn(cwd="/tmp", busy=True)
+    pool._connections[("a", "s1")] = busy
+
+    with pytest.raises(AcpError, match="busy"):
+        await pool.get_or_create("a", "s1", cwd="/repo")
+    assert not busy.killed
+    assert pool._connections[("a", "s1")] is busy

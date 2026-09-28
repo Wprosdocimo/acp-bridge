@@ -19,7 +19,6 @@ import asyncio
 import json
 import os
 import sys
-import uuid
 from typing import Any
 
 import httpx
@@ -72,7 +71,11 @@ async def list_tools() -> list[Tool]:
                     "cwd": {"type": "string", "description": "Working directory for the agent"},
                     "session_id": {
                         "type": "string",
-                        "description": "Session ID for multi-turn conversation continuity",
+                        "description": (
+                            "Session ID for multi-turn conversation continuity. "
+                            "Omit to share the agent's default session; pass a distinct "
+                            "one per repo/task to keep a separate process and cwd."
+                        ),
                     },
                 },
                 "required": ["agent", "prompt"],
@@ -200,6 +203,20 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
         return [TextContent(type="text", text=f"Error: {type(e).__name__}: {e}")]
 
 
+def _fallback_banner(content: str) -> str:
+    """Compact one-line notice out of the bridge's fallback_info part.
+
+    The part carries two human-readable lines plus an HTML comment holding the
+    raw metadata (src/agents.py); only the readable lines are worth relaying.
+    """
+    lines = [
+        line.strip()
+        for line in content.splitlines()
+        if line.strip() and not line.strip().startswith("<!--")
+    ]
+    return "[" + " | ".join(lines) + "]" if lines else "[fallback: agent substituted]"
+
+
 async def _dispatch(name: str, args: dict[str, Any]) -> str:
     if name == "acp_list_agents":
         resp = await http_client.get("/agents")
@@ -214,26 +231,50 @@ async def _dispatch(name: str, args: dict[str, Any]) -> str:
         return "\n".join(lines)
 
     elif name == "acp_call":
+        # cwd and session_id travel as headers, not as fields on the request:
+        # top-level keys are dropped by the ACP SDK (the old top-level cwd here
+        # never reached the bridge, leaving the agent in its config working_dir
+        # - kiro auditing /tmp while the caller believed it was in the repo,
+        # 2026-09-14), and part metadata is rejected outright by the SDK's
+        # discriminated union ("Unable to extract tag using discriminator
+        # 'kind'"). src/agents.py reads both headers for exactly this reason.
         payload: dict[str, Any] = {
             "agent_name": args["agent"],
-            "session_id": args.get("session_id") or str(uuid.uuid4()),
             "input": [{"parts": [{"content": args["prompt"], "content_type": "text/plain"}]}],
         }
+        headers: dict[str, str] = {}
         if args.get("cwd"):
-            payload["cwd"] = args["cwd"]
+            headers["x-acp-cwd"] = args["cwd"]
+        if args.get("session_id"):
+            # Only when the caller asks for one. Without it the bridge derives a
+            # single session per agent, which is what keeps unrelated calls on a
+            # warm process instead of spawning one per request.
+            headers["x-acp-session"] = args["session_id"]
 
-        resp = await http_client.post("/runs", json=payload)
+        resp = await http_client.post("/runs", json=payload, headers=headers or None)
         resp.raise_for_status()
         data = resp.json()
 
         status = data.get("status", "unknown")
         if status == "completed":
             parts = []
+            fallbacks = []
             for output in data.get("output", []):
                 for part in output.get("parts", []):
-                    if part.get("name") not in ("thought", "fallback_info") and part.get("content"):
-                        parts.append(part["content"])
-            return "\n".join(parts) if parts else "(empty response)"
+                    if not part.get("content"):
+                        continue
+                    part_name = part.get("name")
+                    if part_name == "thought":
+                        continue
+                    if part_name == "fallback_info":
+                        # The bridge reroutes to another agent when the requested one
+                        # fails to start; dropping this part made the substitution
+                        # invisible to the caller (kiro answering as claude, 2026-09-14).
+                        fallbacks.append(_fallback_banner(part["content"]))
+                        continue
+                    parts.append(part["content"])
+            body = "\n".join(parts) if parts else "(empty response)"
+            return "\n\n".join(fallbacks + [body]) if fallbacks else body
         elif status == "failed":
             err = data.get("error", {})
             return f"Failed: {err.get('code', 'error')}: {err.get('message', 'unknown')}"
@@ -264,7 +305,12 @@ async def _dispatch(name: str, args: dict[str, Any]) -> str:
         data = resp.json()
         status = data.get("status", "unknown")
         if status == "completed":
-            return f"Completed ({data.get('duration', '?')}s):\n\n{data.get('result', '')}"
+            banner = ""
+            original = data.get("original_agent")
+            if original and original != data.get("agent"):
+                history = " -> ".join(data.get("fallback_history", []) + [data.get("agent", "?")])
+                banner = f"[fallback: requested {original}, answered by {data.get('agent', '?')} ({history})]\n\n"
+            return f"Completed ({data.get('duration', '?')}s):\n\n{banner}{data.get('result', '')}"
         elif status == "failed":
             return f"Failed: {data.get('error', 'unknown')}"
         return f"Status: {status}"
