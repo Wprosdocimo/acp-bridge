@@ -18,7 +18,7 @@
 #   ACP_FALLBACK    — Comma-separated fallback agents (e.g. "claude,opencode")
 #   ACP_TRACE_ID    — Forward as X-Request-Id header (for cross-service tracing)
 #
-# Dependencies: curl, jq, uuidgen
+# Dependencies: curl, jq
 
 set -euo pipefail
 
@@ -132,8 +132,9 @@ fi
 
 PROMPT="$*"
 
-# --- session_id: deterministic UUID v5 ---
-[[ -z "$SESSION" ]] && SESSION=$(uuidgen -s -n @dns -N "$AGENT")
+# --- session_id: empty unless -s is given ---
+# The bridge derives the default session from (agent, cwd), so calls from
+# different repos/worktrees do not share one agent process.
 
 # --- Build JSON payload ---
 MODE="sync"
@@ -184,9 +185,14 @@ _BODY="$_TMPDIR/body"
 _HEADERS="$_TMPDIR/headers"
 
 call_api() {
+    # /runs drops top-level session_id/cwd in the body (ACP SDK); the bridge
+    # reads them from these headers instead.
+    local ctx=()
+    [[ -n "$SESSION" ]] && ctx+=(-H "x-acp-session: $SESSION")
+    [[ -n "$CWD" ]] && ctx+=(-H "x-acp-cwd: $CWD")
     if [[ "$MODE" == "stream" ]]; then
         curl -sN --connect-timeout "$CONNECT_TIMEOUT" \
-            -X POST "${AUTH[@]}" "$URL/runs" \
+            -X POST "${AUTH[@]}" "${ctx[@]}" "$URL/runs" \
             -H "Content-Type: application/json" \
             -H "Accept: text/event-stream" \
             -d "$PAYLOAD"
@@ -194,7 +200,7 @@ call_api() {
         local http_code
         http_code=$(curl -s --connect-timeout "$CONNECT_TIMEOUT" --max-time "$SYNC_TIMEOUT" \
             -o "$_BODY" -D "$_HEADERS" -w '%{http_code}' \
-            -X POST "${AUTH[@]}" "$URL/runs" \
+            -X POST "${AUTH[@]}" "${ctx[@]}" "$URL/runs" \
             -H "Content-Type: application/json" \
             -d "$PAYLOAD") || return 1
 
@@ -267,7 +273,7 @@ retry() {
             if [[ -n "$fb" ]]; then
                 echo "⚠️ $AGENT rate-limited, switching to $fb" >&2
                 AGENT="$fb"
-                SESSION=$(uuidgen -s -n @dns -N "$AGENT")
+                SESSION=""
                 _rebuild_payload
                 continue
             fi
@@ -367,7 +373,7 @@ if $CARD; then
 
     echo ""
     echo "---"
-    echo "_session: \`${SESSION:0:8}…\`_"
+    echo "_session: \`${SESSION:+${SESSION:0:8}…}${SESSION:-default}\`_"
     exit 0
 fi
 
