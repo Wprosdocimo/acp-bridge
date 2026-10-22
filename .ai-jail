@@ -51,7 +51,7 @@ rw_maps = [
     # Mounting the whole Projects tree (not just Playground) so any repo
     # under it is reachable, matching the bridge's actual use case: routing
     # work to arbitrary harnesses across all of the user's projects.
-    "/mnt/wsl/PhysicalDrive3p1/Projects",
+    "/mnt/projetos/Projects",
 ]
 
 # No secrets tracked in acp-bridge's own repo tree (checked 2026-08-10: no
