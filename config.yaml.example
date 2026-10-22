@@ -43,6 +43,26 @@ retention:
 harness:
   binary: ""                                    # absolute path to harness-factory binary; empty = disabled
 
+# Jev router (v0.47.0) — a virtual agent (default name "auto") that asks TypeSafe AI's
+# Jev (System One decision model, https://docs.typesafe.ai) which local agent should
+# run a task, then hands the request to that agent unchanged. Disabled by default:
+# when enabled=false nothing is registered and every existing path is untouched.
+# Any Jev failure / low confidence / "other" answer falls back to default_agent —
+# a Jev outage can never fail a task. Only the first max_state_chars of the prompt
+# leave the host. The key stays in .env; never paste it here.
+# Endpoints: POST /route/preview {prompt} (dry-run), GET /route/status.
+router:
+  enabled: false
+  agent_name: "auto"                            # virtual agent name; must not collide with a real agent
+  api_key: "${TYPESAFE_API_KEY}"                # from .env (console.typesafe.ai/keys)
+  model: "jev-latest"                           # pin e.g. "jev-1.13.0" once thresholds are tuned
+  timeout: 10                                   # seconds per Jev call
+  confidence_threshold: 0.5                     # below this -> default_agent
+  default_agent: "kiro"                         # must be a configured agent
+  candidates: []                                # allowlist; empty = all enabled local agents
+  exclude: []                                   # denylist applied after candidates
+  max_state_chars: 6000                         # prompt prefix sent to Jev
+
 # Lambda Burst (v0.45.0) — serverless burst backend for harness-factory agents.
 # Deploy infra/lambda-burst/ via CDK first, then set function_name to the
 # CDK output. Disabled by default; when disabled, /lambda-pool/* returns 503
@@ -105,7 +125,11 @@ agents:
     acp_args: ["acp", "--trust-all-tools"]
     working_dir: "/tmp"
     # trust: "workspace"   # level 1 — free fs access except security blacklist. Default is level 0 (sandboxed).
-    description: "Kiro CLI agent"
+    description: "Kiro CLI agent — builds and deploys infrastructure-as-code and cloud apps on AWS (Terraform, CDK, Kubernetes/Helm), spec-driven coding"
+    capabilities:
+      domains: ["coding", "cloud", "devops", "infrastructure-as-code", "deployment", "terminal"]
+      tags: ["agentic-ide", "aws", "cli-first", "low-latency", "spec-driven"]
+      tools: ["terraform", "cdk", "kubectl", "helm", "aws-cli"]
     metadata:
       author: {name: "AWS", url: "https://kiro.dev"}
       license: "Apache-2.0"
@@ -122,7 +146,11 @@ agents:
     command: "claude-agent-acp"
     acp_args: []
     working_dir: "/tmp"
-    description: "Claude Code agent (via ACP adapter)"
+    description: "Claude Code agent — deep multi-file coding: large refactors, architecture changes, hard debugging, careful reasoning over big codebases"
+    capabilities:
+      domains: ["coding", "debugging", "refactoring", "architecture", "large-codebase"]
+      tags: ["agentic-cli", "claude-sonnet", "expensive", "high-accuracy", "slow-response", "terminal"]
+      tools: ["code_search", "multi-file-edit", "test-runner"]
     metadata:
       author: {name: "Anthropic", url: "https://anthropic.com"}
       license: "MIT"
@@ -141,7 +169,11 @@ agents:
     working_dir: "/tmp"
     idle_timeout: 300      # kill if no stdout for this many seconds
     max_duration: 600      # hard cap on total wall-clock runtime (seconds)
-    description: "OpenAI Codex CLI agent"
+    description: "OpenAI Codex CLI agent — code review, pull-request feedback, CI/automation scripts, GitHub workflow tasks"
+    capabilities:
+      domains: ["code-review", "pull-requests", "ci-cd", "automation", "coding"]
+      tags: ["agentic-cli", "open-source", "terminal", "pr-review"]
+      tools: ["git", "gh", "diff-review"]
     metadata:
       author: {name: "OpenAI", url: "https://openai.com"}
       license: "Apache-2.0"
@@ -157,7 +189,11 @@ agents:
     command: "qwen"
     acp_args: ["--acp"]
     working_dir: "/tmp"
-    description: "Qwen Code agent"
+    description: "Qwen Code agent (Qwen3-Coder via Bedrock) — fast, low-cost coding: small bug fixes and patches in existing files, boilerplate, unit tests, scripts"
+    capabilities:
+      domains: ["bug-fix", "code-generation", "unit-tests", "boilerplate", "scripting", "coding"]
+      tags: ["agentic-cli", "fast", "low-cost", "open-source", "qwen3-coder"]
+      tools: ["pytest", "code-generation", "patch"]
     metadata:
       author: {name: "Alibaba Qwen Team", url: "https://qwenlm.github.io"}
       license: "Apache-2.0"
@@ -174,7 +210,11 @@ agents:
     command: "opencode"
     acp_args: ["acp"]
     working_dir: "/tmp"
-    description: "OpenCode agent (open source, multi-provider)"
+    description: "OpenCode agent (open source) — terminal-centric coding and repo chores: git operations, build/lint fixes, dependency upgrades, running and fixing CI locally, provider-agnostic model backend"
+    capabilities:
+      domains: ["repo-maintenance", "build-tooling", "dependency-upgrades", "terminal", "coding"]
+      tags: ["agentic-cli", "open-source", "provider-agnostic", "open-weight-models"]
+      tools: ["git", "npm", "make", "linters"]
     metadata:
       author: {name: "OpenCode AI", url: "https://opencode.ai"}
       license: "MIT"
@@ -191,7 +231,11 @@ agents:
     command: "hermes"
     acp_args: ["acp"]
     working_dir: "/tmp"
-    description: "Hermes Agent (open source, multi-provider)"
+    description: "Hermes Agent (Nous Research) — personal assistant with memory and skills: research, summaries, scheduled reminders, messaging (Telegram/Discord/webhook) delivery"
+    capabilities:
+      domains: ["personal-assistant", "research", "messaging", "scheduling", "summarization"]
+      tags: ["agentic-cli", "open-source", "provider-agnostic", "memory", "skills"]
+      tools: ["web-search", "messaging", "cron"]
     metadata:
       author: {name: "Nous Research", url: "https://nousresearch.com"}
       license: "MIT"
@@ -215,7 +259,11 @@ agents:
     acp_args: ["/opt/acp-bridge/src/adapters/aws_devops_launcher.py"]
     working_dir: "/tmp/aws-devops-agent"
     idle_ttl: 3600
-    description: "AWS DevOps Agent (safe ACP launcher)"
+    description: "AWS DevOps Agent — investigates and troubleshoots *existing* AWS resources: incident root cause, CloudWatch alarms/logs/metrics, service errors, cost anomalies. Read-first operations, not code writing"
+    capabilities:
+      domains: ["aws-operations", "incident-response", "root-cause-analysis", "observability", "sre"]
+      tags: ["aws-native", "investigation", "read-mostly", "production-troubleshooting"]
+      tools: ["cloudwatch-logs", "cloudwatch-metrics", "cloudtrail", "x-ray", "cost-explorer", "aws-health"]
     env:
       DEVOPS_AGENT_USER_ID: "${DEVOPS_AGENT_USER_ID}"
       DEVOPS_AGENT_REGION: "${DEVOPS_AGENT_REGION}"
